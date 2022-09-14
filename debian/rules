@@ -1,0 +1,61 @@
+#!/usr/bin/make -f
+# See debhelper(7) (uncomment to enable)
+# output every command that modifies files on the build system.
+#export DH_VERBOSE = 1
+
+DEB_HOST_MULTIARCH ?= $(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	dh_auto_configure -- --with-omx-target=generic
+
+override_dh_auto_build: gst-omx-listcomponents.1
+	dh_auto_configure -- --with-omx-target=bellagio
+	dh_auto_build
+	dh_auto_test
+	dh_auto_install --destdir=$(CURDIR)/debian/tmp-bellagio
+	find $(CURDIR)/debian/tmp-bellagio/usr/lib -name '*.so' -exec rename s/\\.so$$/-bellagio\\.so/ {} \;
+	find $(CURDIR)/debian/tmp-bellagio/usr/lib -name '*.la' -exec rename s/\\.la$$/-bellagio\\.la/ {} \;
+	find $(CURDIR)/debian/tmp-bellagio/etc/xdg -name '*.conf' -exec rename s/\\.conf$$/-bellagio\\.conf/ {} \;
+	dh_auto_clean
+
+#	dh_auto_configure -- --with-omx-target=rpi
+#	dh_auto_build
+#	dh_auto_install --destdir=$(CURDIR)/debian/tmp-rpi
+#	dh_auto_clean
+
+	dh_auto_configure -- --with-omx-target=generic
+	dh_auto_build
+	cp tools/listcomponents tools/gst-omx-listcomponents
+
+override_dh_auto_install:
+	dh_auto_install
+	find $(CURDIR)/debian/tmp/usr/lib -name '*.so' -exec rename s/\\.so$$/-generic\\.so/ {} \;
+	find $(CURDIR)/debian/tmp/usr/lib -name '*.la' -exec rename s/\\.la$$/-generic\\.la/ {} \;
+	mkdir -p $(CURDIR)/debian/tmp/etc/xdg
+	cp -n -R $(CURDIR)/debian/tmp-bellagio/* $(CURDIR)/debian/tmp
+
+override_dh_auto_clean:
+	rm -rf $(CURDIR)/debian/tmp-bellagio
+	rm -rf $(CURDIR)/debian/tmp-rpi
+	dh_auto_clean
+	rm -f $(MULTIARCH_INSTALL)
+
+MULTIARCH_INSTALL = debian/gstreamer1.0-omx-generic.postinst \
+		    debian/gstreamer1.0-omx-generic.prerm \
+		    debian/gstreamer1.0-omx-bellagio.postinst \
+		    debian/gstreamer1.0-omx-bellagio.prerm
+
+$(MULTIARCH_INSTALL): % : %.in
+	sed 's/@DEB_HOST_MULTIARCH@/$(DEB_HOST_MULTIARCH)/g' $< > $@
+
+override_dh_install: $(MULTIARCH_INSTALL)
+	dh_install
+
+DB2MAN = /usr/share/sgml/docbook/stylesheet/xsl/docbook-xsl/manpages/docbook.xsl
+XP     = xsltproc -''-nonet -''-param man.charmap.use.subset "0"
+
+gst-omx-listcomponents.1: debian/gst-omx-listcomponents.1.xml
+	$(XP) $(DB2MAN) $<

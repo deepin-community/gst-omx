@@ -1,0 +1,17 @@
+Description: Remove unknown distclean-local-orc
+ distclean-local-orc target causes FTBFS. And seems useless. Removed.
+Forwarded: not-needed
+Author: Ying-Chun Liu (PaulLiu) <paulliu@debian.org>
+Index: gst-omx-1.14.4/tests/check/Makefile.am
+===================================================================
+--- gst-omx-1.14.4.orig/tests/check/Makefile.am
++++ gst-omx-1.14.4/tests/check/Makefile.am
+@@ -31,7 +31,7 @@ AM_TESTS_ENVIRONMENT += \
+ CLEANFILES = core.* test-registry.*
+ 
+ clean-local: clean-local-check
+-distclean-local: distclean-local-orc
++distclean-local:
+ 
+ check_PROGRAMS = \
+ 	generic/states
