@@ -1,6 +1,6 @@
 project('gst-omx', 'c',
-  version : '1.14.4',
-  meson_version : '>= 0.36.0',
+  version : '1.18.3',
+  meson_version : '>= 0.47',
   default_options : [ 'warning_level=1',
                       'buildtype=debugoptimized' ])
 
@@ -15,9 +15,9 @@ else
   gst_version_nano = 0
 endif
 
-glib_req = '>= 2.40.0'
+glib_req = '>= 2.44.0'
 gst_req = '>= @0@.@1@.0'.format(gst_version_major, gst_version_minor)
-tizil_req = '>= 0.1.0'
+tizil_req = '>= 0.19.0'
 api_version = '1.0'
 
 plugins_install_dir = '@0@/gstreamer-1.0'.format(get_option('libdir'))
@@ -106,7 +106,7 @@ endforeach
 cdata.set('VERSION', '"@0@"'.format(gst_version))
 cdata.set('PACKAGE', '"gst-omx"')
 cdata.set('PACKAGE_VERSION', '"@0@"'.format(gst_version))
-cdata.set('PACKAGE_BUGREPORT', '"http://bugzilla.gnome.org/enter_bug.cgi?product=GStreamer"')
+cdata.set('PACKAGE_BUGREPORT', '"https://gitlab.freedesktop.org/gstreamer/gst-omx/issues/new"')
 cdata.set('PACKAGE_NAME', '"GStreamer OMX Plugins"')
 cdata.set('GETTEXT_PACKAGE', '"gst-omx-1.0"')
 cdata.set('GST_API_VERSION', '"@0@"'.format(api_version))
@@ -151,19 +151,18 @@ gstgl_dep = dependency('gstreamer-gl-1.0', version : gst_req,
 
 x11_dep = dependency('x11', required : false)
 
-if host_machine.system() != 'windows'
-  gstcheck_dep = dependency('gstreamer-check-1.0', version : gst_req,
+gstcheck_dep = dependency('gstreamer-check-1.0', version : gst_req,
+    required : get_option('tests'),
     fallback : ['gstreamer', 'gst_check_dep'])
-endif
 
 libm = cc.find_library('m', required : false)
-glib_dep = dependency('glib-2.0', version : glib_req)
-gio_dep = dependency('gio-2.0', version : glib_req)
-gmodule_dep = dependency('gmodule-2.0', version : glib_req)
+glib_dep = dependency('glib-2.0', version : glib_req, fallback: ['glib', 'libglib_dep'])
+gio_dep = dependency('gio-2.0', version : glib_req, fallback: ['glib', 'libgio_dep'] )
+gmodule_dep = dependency('gmodule-2.0', version : glib_req, fallback: ['glib', 'libgmodule_dep'])
 
 gst_omx_args = ['-DHAVE_CONFIG_H']
 configinc = include_directories('.')
-omx_header_path = get_option('with_omx_header_path')
+omx_header_path = get_option('header_path')
 if omx_header_path != ''
   omx_inc = []
   gst_omx_args += ['-I' + omx_header_path]
@@ -172,7 +171,7 @@ else
 endif
 
 default_omx_struct_packing = 0
-omx_target = get_option ('with_omx_target')
+omx_target = get_option ('target')
 if omx_target == 'generic'
   cdata.set('USE_OMX_TARGET_GENERIC', 1)
 elif omx_target == 'rpi'
@@ -205,17 +204,23 @@ elif omx_target == 'zynqultrascaleplus'
       args : gst_omx_args,
       include_directories : [omx_inc])
   if not have_allegro_header
-    error ('Need Allegro OMX headers to build for Zynq UltraScale+. Use with_omx_header_path option to specify the path of those headers.')
+    error ('Need Allegro OMX headers to build for Zynq UltraScale+. Use -Dheader_path option to specify the path of those headers.')
   endif
 elif omx_target == 'tizonia'
+  if omx_header_path != ''
+    warning('Ignoring -Dheader_path because path is in tizilheaders.pc')
+  endif
   cdata.set('USE_OMX_TARGET_TIZONIA', 1)
   tizil_dep = dependency('tizilheaders', version : tizil_req)
   cdata.set('TIZONIA_LIBDIR', tizil_dep.get_pkgconfig_variable('libdir'))
   tizil_includedir = tizil_dep.get_pkgconfig_variable('includedir')
   gst_omx_args += ['-I' + tizil_includedir + '/tizonia']
+  omx_inc = []
 else
-  error ('Unsupported omx target specified. Use the -Dwith_omx_target option')
+  error ('Unsupported omx target specified. Use the -Dtarget option')
 endif
+
+message ('OMX target: ' + omx_target)
 
 extra_video_headers = ''
 # Check for optional OpenMAX extension headers
@@ -311,7 +316,7 @@ if x11_dep.found()
   cdata.set ('HAVE_X11', 1)
 endif
 
-omx_struct_packing = get_option ('with_omx_struct_packing').to_int()
+omx_struct_packing = get_option ('struct_packing').to_int()
 if omx_struct_packing == 0
   omx_struct_packing = default_omx_struct_packing
 endif
@@ -322,13 +327,99 @@ endif
 omx_conf_dir = join_paths (get_option ('prefix'), get_option ('sysconfdir'), 'xdg')
 cdata.set_quoted('GST_OMX_CONFIG_DIR', omx_conf_dir)
 
-configure_file(output : 'config.h', configuration : cdata)
+warning_flags = [
+  '-Wmissing-declarations',
+  '-Wredundant-decls',
+  '-Wwrite-strings',
+  '-Winit-self',
+  '-Wmissing-include-dirs',
+  '-Wno-multichar',
+  '-Wvla',
+  '-Wpointer-arith',
+  '-Wundef',
+]
+
+warning_c_flags = [
+  '-Wmissing-prototypes',
+  '-Wdeclaration-after-statement',
+  '-Wold-style-definition',
+  '-Waggregate-return',
+]
+
+have_cxx = add_languages('cpp', required : false)
+
+if have_cxx
+  cxx = meson.get_compiler('cpp')
+endif
+
+foreach extra_arg : warning_flags
+  if cc.has_argument (extra_arg)
+    add_project_arguments([extra_arg], language: 'c')
+  endif
+  if have_cxx and cxx.has_argument (extra_arg)
+    add_project_arguments([extra_arg], language: 'cpp')
+  endif
+endforeach
+
+foreach extra_arg : warning_c_flags
+  if cc.has_argument (extra_arg)
+    add_project_arguments([extra_arg], language: 'c')
+  endif
+endforeach
+
+# Disable compiler warnings for unused variables and args if gst debug system is disabled
+if gst_dep.type_name() == 'internal'
+  gst_debug_disabled = not subproject('gstreamer').get_variable('gst_debug')
+else
+  # We can't check that in the case of subprojects as we won't
+  # be able to build against an internal dependency (which is not built yet)
+  gst_debug_disabled = cc.has_header_symbol('gst/gstconfig.h', 'GST_DISABLE_GST_DEBUG', dependencies: gst_dep)
+endif
+
+if gst_debug_disabled
+  message('GStreamer debug system is disabled')
+  if cc.has_argument('-Wno-unused')
+    add_project_arguments('-Wno-unused', language: 'c')
+  endif
+  if have_cxx and cxx.has_argument ('-Wno-unused')
+    add_project_arguments('-Wno-unused', language: 'cpp')
+  endif
+else
+  message('GStreamer debug system is enabled')
+endif
 
 subdir('config')
-subdir('examples')
+
+if not get_option('examples').disabled()
+  subdir('examples')
+endif
+
 subdir('omx')
-subdir('tools')
-subdir('tests')
+
+if not get_option('tools').disabled()
+  subdir('tools')
+endif
+
+if not get_option('tests').disabled() and gstcheck_dep.found()
+  subdir('tests')
+endif
+subdir('docs')
+
+# Set release date
+if gst_version_nano == 0
+  extract_release_date = find_program('scripts/extract-release-date-from-doap-file.py')
+  run_result = run_command(extract_release_date, gst_version, files('gst-omx.doap'))
+  if run_result.returncode() == 0
+    release_date = run_result.stdout().strip()
+    cdata.set_quoted('GST_PACKAGE_RELEASE_DATETIME', release_date)
+    message('Package release date: ' + release_date)
+  else
+    # Error out if our release can't be found in the .doap file
+    error(run_result.stderr())
+  endif
+endif
+
+configure_file(output: 'config.h', configuration: cdata)
 
 python3 = find_program('python3')
 run_command(python3, '-c', 'import shutil; shutil.copy("hooks/pre-commit.hook", ".git/hooks/pre-commit")')

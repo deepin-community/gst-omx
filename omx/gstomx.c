@@ -53,7 +53,7 @@
 GST_DEBUG_CATEGORY (gstomx_debug);
 #define GST_CAT_DEFAULT gstomx_debug
 
-GST_DEBUG_CATEGORY_STATIC (OMX_PERFORMANCE);
+GST_DEBUG_CATEGORY_STATIC (OMX_API_TRACE);
 
 /* Macros used to log result of OMX calls. Use the requested debug level if the
  * operation succeeded and GST_LEVEL_ERROR if not.
@@ -245,6 +245,8 @@ gst_omx_buffer_reset (GstOMXBuffer * buf)
   GST_OMX_SET_TICKS (buf->omx_buf->nTimeStamp, G_GUINT64_CONSTANT (0));
 }
 
+static void gst_omx_buffer_unmap (GstOMXBuffer * buffer);
+
 /* NOTE: Call with comp->lock, comp->messages_lock will be used */
 static void
 gst_omx_component_handle_messages (GstOMXComponent * comp)
@@ -375,8 +377,11 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
             "%s port %u got buffer flags 0x%08x (%s)", comp->name, port->index,
             (guint) flags, gst_omx_buffer_flags_to_string (flags));
         if ((flags & OMX_BUFFERFLAG_EOS)
-            && port->port_def.eDir == OMX_DirOutput)
+            && port->port_def.eDir == OMX_DirOutput && !port->eos) {
+          GST_DEBUG_OBJECT (comp->parent, "%s port %u is EOS", comp->name,
+              port->index);
           port->eos = TRUE;
+        }
 
         break;
       }
@@ -385,6 +390,8 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
         GstOMXPort *port;
 
         port = buf->port;
+
+        buf->used = FALSE;
 
         if (msg->content.buffer_done.empty) {
           /* Input buffer is empty again and can be used to contain new input */
@@ -397,6 +404,9 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
            * valid anymore after the buffer was consumed
            */
           gst_omx_buffer_reset (buf);
+
+          /* Release and unmap the parent buffer, if any */
+          gst_omx_buffer_unmap (buf);
         } else {
           /* Output buffer contains output now or
            * the port was flushed */
@@ -405,13 +415,18 @@ gst_omx_component_handle_messages (GstOMXComponent * comp)
               buf, buf->omx_buf->pBuffer);
 
           if ((buf->omx_buf->nFlags & OMX_BUFFERFLAG_EOS)
-              && port->port_def.eDir == OMX_DirOutput)
+              && port->port_def.eDir == OMX_DirOutput && !port->eos) {
+            GST_DEBUG_OBJECT (comp->parent, "%s port %u is EOS", comp->name,
+                port->index);
             port->eos = TRUE;
+          }
         }
 
-        buf->used = FALSE;
-
-        g_queue_push_tail (&port->pending_buffers, buf);
+        /* If an input port is managed by a pool, the buffer will be ready to be
+         * filled again once it's been released to the pool. */
+        if (port->port_def.eDir == OMX_DirOutput || !port->using_pool) {
+          g_queue_push_tail (&port->pending_buffers, buf);
+        }
 
         break;
       }
@@ -480,11 +495,155 @@ gst_omx_component_wait_message (GstOMXComponent * comp, GstClockTime timeout)
   return signalled;
 }
 
+static const gchar *
+omx_event_type_to_str (OMX_EVENTTYPE event)
+{
+  switch (event) {
+    case OMX_EventCmdComplete:
+      return "EventCmdComplete";
+    case OMX_EventError:
+      return "EventError";
+    case OMX_EventMark:
+      return "EventMark";
+    case OMX_EventPortSettingsChanged:
+      return "EventPortSettingsChanged";
+    case OMX_EventBufferFlag:
+      return "EventBufferFlag";
+    case OMX_EventResourcesAcquired:
+      return "EventResourcesAcquired";
+    case OMX_EventComponentResumed:
+      return "EventComponentResumed";
+    case OMX_EventDynamicResourcesAvailable:
+      return "EventDynamicResourcesAvailable";
+    case OMX_EventPortFormatDetected:
+      return "EventPortFormatDetected";
+#ifdef OMX_EventIndexSettingChanged
+    case OMX_EventIndexSettingChanged:
+      return "EventIndexSettingChanged";
+#endif
+#ifdef OMX_EventPortNeedsDisable
+    case OMX_EventPortNeedsDisable:
+      return "EventPortNeedsDisable";
+#endif
+#ifdef OMX_EventPortNeedsFlush
+    case OMX_EventPortNeedsFlush:
+      return "EventPortNeedsFlush";
+#endif
+    case OMX_EventKhronosExtensions:
+    case OMX_EventVendorStartUnused:
+    case OMX_EventMax:
+    default:
+      break;
+  }
+
+  return NULL;
+}
+
+/* See "Table 3-11: Event Parameter Usage" */
+static GstStructure *
+omx_event_to_debug_struct (OMX_EVENTTYPE event,
+    guint32 data1, guint32 data2, gpointer event_data)
+{
+  const gchar *name;
+
+  name = omx_event_type_to_str (event);
+  switch (event) {
+    case OMX_EventCmdComplete:
+    {
+      const gchar *cmd = gst_omx_command_to_string (data1);
+
+      if (!cmd)
+        break;
+
+      switch (data1) {
+        case OMX_CommandStateSet:
+          return gst_structure_new (name,
+              "command", G_TYPE_STRING, cmd,
+              "state-reached", G_TYPE_STRING, gst_omx_state_to_string (data2),
+              NULL);
+        case OMX_CommandFlush:
+        case OMX_CommandPortDisable:
+        case OMX_CommandPortEnable:
+        case OMX_CommandMarkBuffer:
+          return gst_structure_new (name,
+              "command", G_TYPE_STRING, cmd, "port", G_TYPE_UINT, data2,
+              "error", G_TYPE_STRING,
+              gst_omx_error_to_string (GPOINTER_TO_UINT (event_data)), NULL);
+        case OMX_CommandKhronosExtensions:
+        case OMX_CommandVendorStartUnused:
+        case OMX_CommandMax:
+          break;
+      }
+    }
+      break;
+    case OMX_EventError:
+      return gst_structure_new (name, "error", G_TYPE_STRING,
+          gst_omx_error_to_string (data1), "extra-info", G_TYPE_STRING,
+          gst_omx_error_to_string (data2), NULL);
+    case OMX_EventMark:
+    case OMX_EventComponentResumed:
+    case OMX_EventResourcesAcquired:
+    case OMX_EventDynamicResourcesAvailable:
+    case OMX_EventPortFormatDetected:
+      return gst_structure_new_empty (name);
+    case OMX_EventPortSettingsChanged:
+#ifdef OMX_EventIndexSettingChanged
+    case OMX_EventIndexSettingChanged:
+#endif
+#ifdef OMX_EventPortNeedsDisable
+    case OMX_EventPortNeedsDisable:
+#endif
+#ifdef OMX_EventPortNeedsFlush
+    case OMX_EventPortNeedsFlush:
+#endif
+      return gst_structure_new (name, "port", G_TYPE_UINT,
+          data1, "param-config", G_TYPE_UINT, data2, NULL);
+    case OMX_EventBufferFlag:
+      return gst_structure_new (name, "port", G_TYPE_UINT,
+          data1, "flags", G_TYPE_STRING, gst_omx_buffer_flags_to_string (data2),
+          NULL);
+    case OMX_EventKhronosExtensions:
+    case OMX_EventVendorStartUnused:
+    case OMX_EventMax:
+    default:
+      break;
+  }
+
+  return NULL;
+}
+
+static void
+log_omx_api_trace_event (GstOMXComponent * comp, OMX_EVENTTYPE event,
+    guint32 data1, guint32 data2, gpointer event_data)
+{
+#ifndef GST_DISABLE_GST_DEBUG
+  GstStructure *s;
+
+  /* Don't bother creating useless structs if not needed */
+  if (gst_debug_category_get_threshold (OMX_API_TRACE) < GST_LEVEL_DEBUG)
+    return;
+
+  s = omx_event_to_debug_struct (event, data1, data2, event_data);
+  if (!s) {
+    GST_CAT_WARNING_OBJECT (OMX_API_TRACE, comp->parent,
+        "invalid event 0x%08x Data1 %u Data2 %u EventData %p", event, data1,
+        data2, event_data);
+    return;
+  }
+
+  GST_CAT_DEBUG_OBJECT (OMX_API_TRACE, comp->parent, "%" GST_PTR_FORMAT, s);
+
+  gst_structure_free (s);
+#endif /* GST_DISABLE_GST_DEBUG */
+}
+
 static OMX_ERRORTYPE
 EventHandler (OMX_HANDLETYPE hComponent, OMX_PTR pAppData, OMX_EVENTTYPE eEvent,
     OMX_U32 nData1, OMX_U32 nData2, OMX_PTR pEventData)
 {
   GstOMXComponent *comp = (GstOMXComponent *) pAppData;
+
+  log_omx_api_trace_event (comp, eEvent, nData1, nData2, pEventData);
 
   switch (eEvent) {
     case OMX_EventCmdComplete:
@@ -645,26 +804,29 @@ gst_omx_buffer_unmap (GstOMXBuffer * buffer)
 }
 
 static void
-log_omx_performance (GstOMXComponent * comp, const gchar * event,
+log_omx_api_trace_buffer (GstOMXComponent * comp, const gchar * event,
     GstOMXBuffer * buf)
 {
+#ifndef GST_DISABLE_GST_DEBUG
   GstStructure *s;
 
   /* Don't bother creating useless structs if not needed */
-  if (gst_debug_category_get_threshold (OMX_PERFORMANCE) < GST_LEVEL_TRACE)
+  if (gst_debug_category_get_threshold (OMX_API_TRACE) < GST_LEVEL_TRACE)
     return;
 
   if (buf) {
-    gchar *buf_str, *omx_buf_str;
+    gchar *buf_str, *omx_buf_str, *pbuffer_str;
 
     /* GST_PTR_FORMAT won't serialize G_TYPE_POINTER fields so stringify pointers */
     buf_str = g_strdup_printf ("%p", buf);
     omx_buf_str = g_strdup_printf ("%p", buf->omx_buf);
+    pbuffer_str = g_strdup_printf ("%p", buf->omx_buf->pBuffer);
 
     /* *INDENT-OFF* */
     s = gst_structure_new (event,
         "GstOMXBuffer", G_TYPE_STRING, buf_str,
         "OMX-buffer", G_TYPE_STRING, omx_buf_str,
+        "pBuffer", G_TYPE_STRING, pbuffer_str,
         "TimeStamp", G_TYPE_UINT64, GST_OMX_GET_TICKS (buf->omx_buf->nTimeStamp),
         "AllocLen", G_TYPE_UINT, buf->omx_buf->nAllocLen,
         "FilledLen", G_TYPE_UINT, buf->omx_buf->nFilledLen,
@@ -675,13 +837,15 @@ log_omx_performance (GstOMXComponent * comp, const gchar * event,
 
     g_free (buf_str);
     g_free (omx_buf_str);
+    g_free (pbuffer_str);
   } else {
     s = gst_structure_new_empty (event);
   }
 
-  GST_CAT_TRACE_OBJECT (OMX_PERFORMANCE, comp->parent, "%" GST_PTR_FORMAT, s);
+  GST_CAT_TRACE_OBJECT (OMX_API_TRACE, comp->parent, "%" GST_PTR_FORMAT, s);
 
   gst_structure_free (s);
+#endif /* GST_DISABLE_GST_DEBUG */
 }
 
 static OMX_ERRORTYPE
@@ -705,9 +869,6 @@ EmptyBufferDone (OMX_HANDLETYPE hComponent, OMX_PTR pAppData,
     return OMX_ErrorBadParameter;
   }
 
-  /* Release and unmap the parent buffer, if any */
-  gst_omx_buffer_unmap (buf);
-
   comp = buf->port->comp;
 
   msg = g_slice_new (GstOMXMessage);
@@ -717,7 +878,7 @@ EmptyBufferDone (OMX_HANDLETYPE hComponent, OMX_PTR pAppData,
   msg->content.buffer_done.buffer = pBuffer;
   msg->content.buffer_done.empty = OMX_TRUE;
 
-  log_omx_performance (comp, "EmptyBufferDone", buf);
+  log_omx_api_trace_buffer (comp, "EmptyBufferDone", buf);
   GST_LOG_OBJECT (comp->parent, "%s port %u emptied buffer %p (%p)",
       comp->name, buf->port->index, buf, buf->omx_buf->pBuffer);
 
@@ -756,7 +917,7 @@ FillBufferDone (OMX_HANDLETYPE hComponent, OMX_PTR pAppData,
   msg->content.buffer_done.buffer = pBuffer;
   msg->content.buffer_done.empty = OMX_FALSE;
 
-  log_omx_performance (comp, "FillBufferDone", buf);
+  log_omx_api_trace_buffer (comp, "FillBufferDone", buf);
   GST_LOG_OBJECT (comp->parent, "%s port %u filled buffer %p (%p)", comp->name,
       buf->port->index, buf, buf->omx_buf->pBuffer);
 
@@ -767,6 +928,10 @@ FillBufferDone (OMX_HANDLETYPE hComponent, OMX_PTR pAppData,
 
 static OMX_CALLBACKTYPE callbacks =
     { EventHandler, EmptyBufferDone, FillBufferDone };
+
+GST_DEFINE_MINI_OBJECT_TYPE (GstOMXComponent, gst_omx_component);
+
+static void gst_omx_component_free (GstOMXComponent * comp);
 
 /* NOTE: Uses comp->lock and comp->messages_lock */
 GstOMXComponent *
@@ -784,6 +949,10 @@ gst_omx_component_new (GstObject * parent, const gchar * core_name,
 
   comp = g_slice_new0 (GstOMXComponent);
   comp->core = core;
+
+  gst_mini_object_init (GST_MINI_OBJECT_CAST (comp), 0,
+      gst_omx_component_get_type (), NULL, NULL,
+      (GstMiniObjectFreeFunction) gst_omx_component_free);
 
   if ((dot = g_strrstr (component_name, ".")))
     comp->name = g_strdup (dot + 1);
@@ -852,7 +1021,7 @@ gst_omx_component_new (GstObject * parent, const gchar * core_name,
 }
 
 /* NOTE: Uses comp->messages_lock */
-void
+static void
 gst_omx_component_free (GstOMXComponent * comp)
 {
   gint i, n;
@@ -891,6 +1060,91 @@ gst_omx_component_free (GstOMXComponent * comp)
   comp->name = NULL;
 
   g_slice_free (GstOMXComponent, comp);
+}
+
+GstOMXComponent *
+gst_omx_component_ref (GstOMXComponent * comp)
+{
+  g_return_val_if_fail (comp, NULL);
+
+  gst_mini_object_ref (GST_MINI_OBJECT_CAST (comp));
+  return comp;
+}
+
+void
+gst_omx_component_unref (GstOMXComponent * comp)
+{
+  g_return_if_fail (comp);
+
+  gst_mini_object_unref (GST_MINI_OBJECT_CAST (comp));
+}
+
+static GstStructure *
+omx_command_to_debug_struct (OMX_COMMANDTYPE cmd,
+    guint32 param, gpointer cmd_data)
+{
+  const gchar *cmd_str;
+
+  cmd_str = gst_omx_command_to_string (cmd);
+
+  switch (cmd) {
+    case OMX_CommandStateSet:
+      return gst_structure_new ("SendCommand",
+          "command", G_TYPE_STRING, cmd_str,
+          "state", G_TYPE_STRING, gst_omx_state_to_string (param), NULL);
+    case OMX_CommandFlush:
+    case OMX_CommandPortDisable:
+    case OMX_CommandPortEnable:
+      return gst_structure_new ("SendCommand",
+          "command", G_TYPE_STRING, cmd_str, "port", G_TYPE_UINT, param, NULL);
+    case OMX_CommandMarkBuffer:
+      return gst_structure_new ("SendCommand",
+          "command", G_TYPE_STRING, cmd_str,
+          "mark-type", G_TYPE_POINTER, cmd_data, NULL);
+    case OMX_CommandKhronosExtensions:
+    case OMX_CommandVendorStartUnused:
+    case OMX_CommandMax:
+    default:
+      break;
+  }
+
+  return NULL;
+}
+
+static void
+log_omx_api_trace_send_command (GstOMXComponent * comp, OMX_COMMANDTYPE cmd,
+    guint32 param, gpointer cmd_data)
+{
+#ifndef GST_DISABLE_GST_DEBUG
+  GstStructure *s;
+
+  /* Don't bother creating useless structs if not needed */
+  if (gst_debug_category_get_threshold (OMX_API_TRACE) < GST_LEVEL_DEBUG)
+    return;
+
+  s = omx_command_to_debug_struct (cmd, param, cmd_data);
+  if (!s) {
+    GST_CAT_WARNING_OBJECT (OMX_API_TRACE, comp->parent,
+        "invalid command 0x%08x Param %u CmdData %p", cmd, param, cmd_data);
+    return;
+  }
+
+  GST_CAT_DEBUG_OBJECT (OMX_API_TRACE, comp->parent, "%" GST_PTR_FORMAT, s);
+
+  gst_structure_free (s);
+#endif /* GST_DISABLE_GST_DEBUG */
+}
+
+static OMX_ERRORTYPE
+gst_omx_component_send_command (GstOMXComponent * comp, OMX_COMMANDTYPE cmd,
+    guint32 param, gpointer cmd_data)
+{
+  OMX_ERRORTYPE err;
+
+  log_omx_api_trace_send_command (comp, cmd, param, cmd_data);
+  err = OMX_SendCommand (comp->handle, cmd, param, cmd_data);
+
+  return err;
 }
 
 /* NOTE: Uses comp->lock and comp->messages_lock */
@@ -933,7 +1187,7 @@ gst_omx_component_set_state (GstOMXComponent * comp, OMX_STATETYPE state)
     gst_omx_component_send_message (comp, NULL);
   }
 
-  err = OMX_SendCommand (comp->handle, OMX_CommandStateSet, state, NULL);
+  err = gst_omx_component_send_command (comp, OMX_CommandStateSet, state, NULL);
   /* No need to check if anything has changed here */
 
 done:
@@ -972,10 +1226,6 @@ gst_omx_component_get_state (GstOMXComponent * comp, GstClockTime timeout)
 
   gst_omx_component_handle_messages (comp);
 
-  ret = comp->state;
-  if (comp->pending_state == OMX_StateInvalid)
-    goto done;
-
   if (comp->last_error != OMX_ErrorNone) {
     GST_ERROR_OBJECT (comp->parent, "Component %s in error state: %s (0x%08x)",
         comp->name, gst_omx_error_to_string (comp->last_error),
@@ -983,6 +1233,10 @@ gst_omx_component_get_state (GstOMXComponent * comp, GstClockTime timeout)
     ret = OMX_StateInvalid;
     goto done;
   }
+
+  ret = comp->state;
+  if (comp->pending_state == OMX_StateInvalid)
+    goto done;
 
   while (signalled && comp->last_error == OMX_ErrorNone
       && comp->pending_state != OMX_StateInvalid) {
@@ -1065,6 +1319,7 @@ gst_omx_component_add_port (GstOMXComponent * comp, guint32 index)
   port->enabled_pending = FALSE;
   port->disabled_pending = FALSE;
   port->eos = FALSE;
+  port->using_pool = FALSE;
 
   if (port->port_def.eDir == OMX_DirInput)
     comp->n_in_ports++;
@@ -1118,6 +1373,530 @@ gst_omx_component_get_last_error_string (GstOMXComponent * comp)
   return gst_omx_error_to_string (gst_omx_component_get_last_error (comp));
 }
 
+#ifndef GST_DISABLE_GST_DEBUG
+static const gchar *
+omx_index_type_to_str (OMX_INDEXTYPE index)
+{
+  switch (index) {
+    case OMX_IndexComponentStartUnused:
+      return "OMX_IndexComponentStartUnused";
+    case OMX_IndexParamPriorityMgmt:
+      return "OMX_IndexParamPriorityMgmt";
+    case OMX_IndexParamAudioInit:
+      return "OMX_IndexParamAudioInit";
+    case OMX_IndexParamImageInit:
+      return "OMX_IndexParamImageInit";
+    case OMX_IndexParamVideoInit:
+      return "OMX_IndexParamVideoInit";
+    case OMX_IndexParamOtherInit:
+      return "OMX_IndexParamOtherInit";
+    case OMX_IndexParamNumAvailableStreams:
+      return "OMX_IndexParamNumAvailableStreams";
+    case OMX_IndexParamActiveStream:
+      return "OMX_IndexParamActiveStream";
+    case OMX_IndexParamSuspensionPolicy:
+      return "OMX_IndexParamSuspensionPolicy";
+    case OMX_IndexParamComponentSuspended:
+      return "OMX_IndexParamComponentSuspended";
+    case OMX_IndexConfigCapturing:
+      return "OMX_IndexConfigCapturing";
+    case OMX_IndexConfigCaptureMode:
+      return "OMX_IndexConfigCaptureMode";
+    case OMX_IndexAutoPauseAfterCapture:
+      return "OMX_IndexAutoPauseAfterCapture";
+    case OMX_IndexParamContentURI:
+      return "OMX_IndexParamContentURI";
+    case OMX_IndexParamDisableResourceConcealment:
+      return "OMX_IndexParamDisableResourceConcealment";
+    case OMX_IndexConfigMetadataItemCount:
+      return "OMX_IndexConfigMetadataItemCount";
+    case OMX_IndexConfigContainerNodeCount:
+      return "OMX_IndexConfigContainerNodeCount";
+    case OMX_IndexConfigMetadataItem:
+      return "OMX_IndexConfigMetadataItem";
+    case OMX_IndexConfigCounterNodeID:
+      return "OMX_IndexConfigCounterNodeID";
+    case OMX_IndexParamMetadataFilterType:
+      return "OMX_IndexParamMetadataFilterType";
+    case OMX_IndexParamMetadataKeyFilter:
+      return "OMX_IndexParamMetadataKeyFilter";
+    case OMX_IndexConfigPriorityMgmt:
+      return "OMX_IndexConfigPriorityMgmt";
+    case OMX_IndexParamStandardComponentRole:
+      return "OMX_IndexParamStandardComponentRole";
+    case OMX_IndexPortStartUnused:
+      return "OMX_IndexPortStartUnused";
+    case OMX_IndexParamPortDefinition:
+      return "OMX_IndexParamPortDefinition";
+    case OMX_IndexParamCompBufferSupplier:
+      return "OMX_IndexParamCompBufferSupplier";
+    case OMX_IndexReservedStartUnused:
+      return "OMX_IndexReservedStartUnused";
+    case OMX_IndexAudioStartUnused:
+      return "OMX_IndexAudioStartUnused";
+    case OMX_IndexParamAudioPortFormat:
+      return "OMX_IndexParamAudioPortFormat";
+    case OMX_IndexParamAudioPcm:
+      return "OMX_IndexParamAudioPcm";
+    case OMX_IndexParamAudioAac:
+      return "OMX_IndexParamAudioAac";
+    case OMX_IndexParamAudioRa:
+      return "OMX_IndexParamAudioRa";
+    case OMX_IndexParamAudioMp3:
+      return "OMX_IndexParamAudioMp3";
+    case OMX_IndexParamAudioAdpcm:
+      return "OMX_IndexParamAudioAdpcm";
+    case OMX_IndexParamAudioG723:
+      return "OMX_IndexParamAudioG723";
+    case OMX_IndexParamAudioG729:
+      return "OMX_IndexParamAudioG729";
+    case OMX_IndexParamAudioAmr:
+      return "OMX_IndexParamAudioAmr";
+    case OMX_IndexParamAudioWma:
+      return "OMX_IndexParamAudioWma";
+    case OMX_IndexParamAudioSbc:
+      return "OMX_IndexParamAudioSbc";
+    case OMX_IndexParamAudioMidi:
+      return "OMX_IndexParamAudioMidi";
+    case OMX_IndexParamAudioGsm_FR:
+      return "OMX_IndexParamAudioGsm_FR";
+    case OMX_IndexParamAudioMidiLoadUserSound:
+      return "OMX_IndexParamAudioMidiLoadUserSound";
+    case OMX_IndexParamAudioG726:
+      return "OMX_IndexParamAudioG726";
+    case OMX_IndexParamAudioGsm_EFR:
+      return "OMX_IndexParamAudioGsm_EFR";
+    case OMX_IndexParamAudioGsm_HR:
+      return "OMX_IndexParamAudioGsm_HR";
+    case OMX_IndexParamAudioPdc_FR:
+      return "OMX_IndexParamAudioPdc_FR";
+    case OMX_IndexParamAudioPdc_EFR:
+      return "OMX_IndexParamAudioPdc_EFR";
+    case OMX_IndexParamAudioPdc_HR:
+      return "OMX_IndexParamAudioPdc_HR";
+    case OMX_IndexParamAudioTdma_FR:
+      return "OMX_IndexParamAudioTdma_FR";
+    case OMX_IndexParamAudioTdma_EFR:
+      return "OMX_IndexParamAudioTdma_EFR";
+    case OMX_IndexParamAudioQcelp8:
+      return "OMX_IndexParamAudioQcelp8";
+    case OMX_IndexParamAudioQcelp13:
+      return "OMX_IndexParamAudioQcelp13";
+    case OMX_IndexParamAudioEvrc:
+      return "OMX_IndexParamAudioEvrc";
+    case OMX_IndexParamAudioSmv:
+      return "OMX_IndexParamAudioSmv";
+    case OMX_IndexParamAudioVorbis:
+      return "OMX_IndexParamAudioVorbis";
+    case OMX_IndexConfigAudioMidiImmediateEvent:
+      return "OMX_IndexConfigAudioMidiImmediateEvent";
+    case OMX_IndexConfigAudioMidiControl:
+      return "OMX_IndexConfigAudioMidiControl";
+    case OMX_IndexConfigAudioMidiSoundBankProgram:
+      return "OMX_IndexConfigAudioMidiSoundBankProgram";
+    case OMX_IndexConfigAudioMidiStatus:
+      return "OMX_IndexConfigAudioMidiStatus";
+    case OMX_IndexConfigAudioMidiMetaEvent:
+      return "OMX_IndexConfigAudioMidiMetaEvent";
+    case OMX_IndexConfigAudioMidiMetaEventData:
+      return "OMX_IndexConfigAudioMidiMetaEventData";
+    case OMX_IndexConfigAudioVolume:
+      return "OMX_IndexConfigAudioVolume";
+    case OMX_IndexConfigAudioBalance:
+      return "OMX_IndexConfigAudioBalance";
+    case OMX_IndexConfigAudioChannelMute:
+      return "OMX_IndexConfigAudioChannelMute";
+    case OMX_IndexConfigAudioMute:
+      return "OMX_IndexConfigAudioMute";
+    case OMX_IndexConfigAudioLoudness:
+      return "OMX_IndexConfigAudioLoudness";
+    case OMX_IndexConfigAudioEchoCancelation:
+      return "OMX_IndexConfigAudioEchoCancelation";
+    case OMX_IndexConfigAudioNoiseReduction:
+      return "OMX_IndexConfigAudioNoiseReduction";
+    case OMX_IndexConfigAudioBass:
+      return "OMX_IndexConfigAudioBass";
+    case OMX_IndexConfigAudioTreble:
+      return "OMX_IndexConfigAudioTreble";
+    case OMX_IndexConfigAudioStereoWidening:
+      return "OMX_IndexConfigAudioStereoWidening";
+    case OMX_IndexConfigAudioChorus:
+      return "OMX_IndexConfigAudioChorus";
+    case OMX_IndexConfigAudioEqualizer:
+      return "OMX_IndexConfigAudioEqualizer";
+    case OMX_IndexConfigAudioReverberation:
+      return "OMX_IndexConfigAudioReverberation";
+    case OMX_IndexConfigAudioChannelVolume:
+      return "OMX_IndexConfigAudioChannelVolume";
+    case OMX_IndexImageStartUnused:
+      return "OMX_IndexImageStartUnused";
+    case OMX_IndexParamImagePortFormat:
+      return "OMX_IndexParamImagePortFormat";
+    case OMX_IndexParamFlashControl:
+      return "OMX_IndexParamFlashControl";
+    case OMX_IndexConfigFocusControl:
+      return "OMX_IndexConfigFocusControl";
+    case OMX_IndexParamQFactor:
+      return "OMX_IndexParamQFactor";
+    case OMX_IndexParamQuantizationTable:
+      return "OMX_IndexParamQuantizationTable";
+    case OMX_IndexParamHuffmanTable:
+      return "OMX_IndexParamHuffmanTable";
+    case OMX_IndexConfigFlashControl:
+      return "OMX_IndexConfigFlashControl";
+    case OMX_IndexVideoStartUnused:
+      return "OMX_IndexVideoStartUnused";
+    case OMX_IndexParamVideoPortFormat:
+      return "OMX_IndexParamVideoPortFormat";
+    case OMX_IndexParamVideoQuantization:
+      return "OMX_IndexParamVideoQuantization";
+    case OMX_IndexParamVideoFastUpdate:
+      return "OMX_IndexParamVideoFastUpdate";
+    case OMX_IndexParamVideoBitrate:
+      return "OMX_IndexParamVideoBitrate";
+    case OMX_IndexParamVideoMotionVector:
+      return "OMX_IndexParamVideoMotionVector";
+    case OMX_IndexParamVideoIntraRefresh:
+      return "OMX_IndexParamVideoIntraRefresh";
+    case OMX_IndexParamVideoErrorCorrection:
+      return "OMX_IndexParamVideoErrorCorrection";
+    case OMX_IndexParamVideoVBSMC:
+      return "OMX_IndexParamVideoVBSMC";
+    case OMX_IndexParamVideoMpeg2:
+      return "OMX_IndexParamVideoMpeg2";
+    case OMX_IndexParamVideoMpeg4:
+      return "OMX_IndexParamVideoMpeg4";
+    case OMX_IndexParamVideoWmv:
+      return "OMX_IndexParamVideoWmv";
+    case OMX_IndexParamVideoRv:
+      return "OMX_IndexParamVideoRv";
+    case OMX_IndexParamVideoAvc:
+      return "OMX_IndexParamVideoAvc";
+    case OMX_IndexParamVideoH263:
+      return "OMX_IndexParamVideoH263";
+    case OMX_IndexParamVideoProfileLevelQuerySupported:
+      return "OMX_IndexParamVideoProfileLevelQuerySupported";
+    case OMX_IndexParamVideoProfileLevelCurrent:
+      return "OMX_IndexParamVideoProfileLevelCurrent";
+    case OMX_IndexConfigVideoBitrate:
+      return "OMX_IndexConfigVideoBitrate";
+    case OMX_IndexConfigVideoFramerate:
+      return "OMX_IndexConfigVideoFramerate";
+    case OMX_IndexConfigVideoIntraVOPRefresh:
+      return "OMX_IndexConfigVideoIntraVOPRefresh";
+    case OMX_IndexConfigVideoIntraMBRefresh:
+      return "OMX_IndexConfigVideoIntraMBRefresh";
+    case OMX_IndexConfigVideoMBErrorReporting:
+      return "OMX_IndexConfigVideoMBErrorReporting";
+    case OMX_IndexParamVideoMacroblocksPerFrame:
+      return "OMX_IndexParamVideoMacroblocksPerFrame";
+    case OMX_IndexConfigVideoMacroBlockErrorMap:
+      return "OMX_IndexConfigVideoMacroBlockErrorMap";
+    case OMX_IndexParamVideoSliceFMO:
+      return "OMX_IndexParamVideoSliceFMO";
+    case OMX_IndexConfigVideoAVCIntraPeriod:
+      return "OMX_IndexConfigVideoAVCIntraPeriod";
+    case OMX_IndexConfigVideoNalSize:
+      return "OMX_IndexConfigVideoNalSize";
+    case OMX_IndexCommonStartUnused:
+      return "OMX_IndexCommonStartUnused";
+    case OMX_IndexParamCommonDeblocking:
+      return "OMX_IndexParamCommonDeblocking";
+    case OMX_IndexParamCommonSensorMode:
+      return "OMX_IndexParamCommonSensorMode";
+    case OMX_IndexParamCommonInterleave:
+      return "OMX_IndexParamCommonInterleave";
+    case OMX_IndexConfigCommonColorFormatConversion:
+      return "OMX_IndexConfigCommonColorFormatConversion";
+    case OMX_IndexConfigCommonScale:
+      return "OMX_IndexConfigCommonScale";
+    case OMX_IndexConfigCommonImageFilter:
+      return "OMX_IndexConfigCommonImageFilter";
+    case OMX_IndexConfigCommonColorEnhancement:
+      return "OMX_IndexConfigCommonColorEnhancement";
+    case OMX_IndexConfigCommonColorKey:
+      return "OMX_IndexConfigCommonColorKey";
+    case OMX_IndexConfigCommonColorBlend:
+      return "OMX_IndexConfigCommonColorBlend";
+    case OMX_IndexConfigCommonFrameStabilisation:
+      return "OMX_IndexConfigCommonFrameStabilisation";
+    case OMX_IndexConfigCommonRotate:
+      return "OMX_IndexConfigCommonRotate";
+    case OMX_IndexConfigCommonMirror:
+      return "OMX_IndexConfigCommonMirror";
+    case OMX_IndexConfigCommonOutputPosition:
+      return "OMX_IndexConfigCommonOutputPosition";
+    case OMX_IndexConfigCommonInputCrop:
+      return "OMX_IndexConfigCommonInputCrop";
+    case OMX_IndexConfigCommonOutputCrop:
+      return "OMX_IndexConfigCommonOutputCrop";
+    case OMX_IndexConfigCommonDigitalZoom:
+      return "OMX_IndexConfigCommonDigitalZoom";
+    case OMX_IndexConfigCommonOpticalZoom:
+      return "OMX_IndexConfigCommonOpticalZoom";
+    case OMX_IndexConfigCommonWhiteBalance:
+      return "OMX_IndexConfigCommonWhiteBalance";
+    case OMX_IndexConfigCommonExposure:
+      return "OMX_IndexConfigCommonExposure";
+    case OMX_IndexConfigCommonContrast:
+      return "OMX_IndexConfigCommonContrast";
+    case OMX_IndexConfigCommonBrightness:
+      return "OMX_IndexConfigCommonBrightness";
+    case OMX_IndexConfigCommonBacklight:
+      return "OMX_IndexConfigCommonBacklight";
+    case OMX_IndexConfigCommonGamma:
+      return "OMX_IndexConfigCommonGamma";
+    case OMX_IndexConfigCommonSaturation:
+      return "OMX_IndexConfigCommonSaturation";
+    case OMX_IndexConfigCommonLightness:
+      return "OMX_IndexConfigCommonLightness";
+    case OMX_IndexConfigCommonExclusionRect:
+      return "OMX_IndexConfigCommonExclusionRect";
+    case OMX_IndexConfigCommonDithering:
+      return "OMX_IndexConfigCommonDithering";
+    case OMX_IndexConfigCommonPlaneBlend:
+      return "OMX_IndexConfigCommonPlaneBlend";
+    case OMX_IndexConfigCommonExposureValue:
+      return "OMX_IndexConfigCommonExposureValue";
+    case OMX_IndexConfigCommonOutputSize:
+      return "OMX_IndexConfigCommonOutputSize";
+    case OMX_IndexParamCommonExtraQuantData:
+      return "OMX_IndexParamCommonExtraQuantData";
+    case OMX_IndexConfigCommonTransitionEffect:
+      return "OMX_IndexConfigCommonTransitionEffect";
+    case OMX_IndexOtherStartUnused:
+      return "OMX_IndexOtherStartUnused";
+    case OMX_IndexParamOtherPortFormat:
+      return "OMX_IndexParamOtherPortFormat";
+    case OMX_IndexConfigOtherPower:
+      return "OMX_IndexConfigOtherPower";
+    case OMX_IndexConfigOtherStats:
+      return "OMX_IndexConfigOtherStats";
+    case OMX_IndexTimeStartUnused:
+      return "OMX_IndexTimeStartUnused";
+    case OMX_IndexConfigTimeScale:
+      return "OMX_IndexConfigTimeScale";
+    case OMX_IndexConfigTimeClockState:
+      return "OMX_IndexConfigTimeClockState";
+    case OMX_IndexConfigTimeCurrentMediaTime:
+      return "OMX_IndexConfigTimeCurrentMediaTime";
+    case OMX_IndexConfigTimeCurrentWallTime:
+      return "OMX_IndexConfigTimeCurrentWallTime";
+    case OMX_IndexConfigTimeMediaTimeRequest:
+      return "OMX_IndexConfigTimeMediaTimeRequest";
+    case OMX_IndexConfigTimeClientStartTime:
+      return "OMX_IndexConfigTimeClientStartTime";
+    case OMX_IndexConfigTimePosition:
+      return "OMX_IndexConfigTimePosition";
+    case OMX_IndexConfigTimeSeekMode:
+      return "OMX_IndexConfigTimeSeekMode";
+    case OMX_IndexKhronosExtensions:
+      return "OMX_IndexKhronosExtensions";
+    case OMX_IndexVendorStartUnused:
+      return "OMX_IndexVendorStartUnused";
+    case OMX_IndexMax:
+      return "OMX_IndexMax";
+    default:
+      break;
+  }
+
+#if OMX_VERSION_MINOR == 1
+  switch (index) {
+    case OMX_IndexParamCustomContentPipe:
+      return "OMX_IndexParamCustomContentPipe";
+    case OMX_IndexConfigCommonFocusRegion:
+      return "OMX_IndexConfigCommonFocusRegion";
+    case OMX_IndexConfigCommonFocusStatus:
+      return "OMX_IndexConfigCommonFocusStatus";
+    case OMX_IndexConfigTimeActiveRefClock:
+      return "OMX_IndexConfigTimeActiveRefClock";
+    case OMX_IndexConfigTimeCurrentAudioReference:
+      return "OMX_IndexConfigTimeCurrentAudioReference";
+    case OMX_IndexConfigTimeCurrentVideoReference:
+      return "OMX_IndexConfigTimeCurrentVideoReference";
+    default:
+      break;
+  }
+#endif
+
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  switch ((OMX_ALG_INDEXTYPE) index) {
+    case OMX_ALG_IndexVendorComponentStartUnused:
+      return "OMX_ALG_IndexVendorComponentStartUnused";
+    case OMX_ALG_IndexParamReportedLatency:
+      return "OMX_ALG_IndexParamReportedLatency";
+    case OMX_ALG_IndexParamPreallocation:
+      return "OMX_ALG_IndexParamPreallocation";
+    case OMX_ALG_IndexVendorPortStartUnused:
+      return "OMX_ALG_IndexVendorPortStartUnused";
+    case OMX_ALG_IndexPortParamBufferMode:
+      return "OMX_ALG_IndexPortParamBufferMode";
+    case OMX_ALG_IndexParamVendorVideoStartUnused:
+      return "OMX_ALG_IndexParamVendorVideoStartUnused";
+    case OMX_ALG_IndexParamVideoHevc:
+      return "OMX_ALG_IndexParamVideoHevc";
+    case OMX_ALG_IndexParamVideoVp9:
+      return "OMX_ALG_IndexParamVideoVp9";
+    case OMX_ALG_IndexParamVideoGopControl:
+      return "OMX_ALG_IndexParamVideoGopControl";
+    case OMX_ALG_IndexParamVideoSlices:
+      return "OMX_ALG_IndexParamVideoSlices";
+    case OMX_ALG_IndexParamVideoSceneChangeResilience:
+      return "OMX_ALG_IndexParamVideoSceneChangeResilience";
+    case OMX_ALG_IndexParamVideoPrefetchBuffer:
+      return "OMX_ALG_IndexParamVideoPrefetchBuffer";
+    case OMX_ALG_IndexParamVideoCodedPictureBuffer:
+      return "OMX_ALG_IndexParamVideoCodedPictureBuffer";
+    case OMX_ALG_IndexParamVideoQuantizationControl:
+      return "OMX_ALG_IndexParamVideoQuantizationControl";
+    case OMX_ALG_IndexParamVideoQuantizationExtension:
+      return "OMX_ALG_IndexParamVideoQuantizationExtension";
+    case OMX_ALG_IndexParamVideoScalingList:
+      return "OMX_ALG_IndexParamVideoScalingList";
+    case OMX_ALG_IndexParamVideoDecodedPictureBuffer:
+      return "OMX_ALG_IndexParamVideoDecodedPictureBuffer";
+    case OMX_ALG_IndexParamVideoInternalEntropyBuffers:
+      return "OMX_ALG_IndexParamVideoInternalEntropyBuffers";
+    case OMX_ALG_IndexParamVideoLowBandwidth:
+      return "OMX_ALG_IndexParamVideoLowBandwidth";
+    case OMX_ALG_IndexParamVideoAspectRatio:
+      return "OMX_ALG_IndexParamVideoAspectRatio";
+    case OMX_ALG_IndexParamVideoSubframe:
+      return "OMX_ALG_IndexParamVideoSubframe";
+    case OMX_ALG_IndexParamVideoInstantaneousDecodingRefresh:
+      return "OMX_ALG_IndexParamVideoInstantaneousDecodingRefresh";
+    case OMX_ALG_IndexParamVideoMaxBitrate:
+      return "OMX_ALG_IndexParamVideoMaxBitrate";
+    case OMX_ALG_IndexParamVideoFillerData:
+      return "OMX_ALG_IndexParamVideoFillerData";
+    case OMX_ALG_IndexParamVideoBufferMode:
+      return "OMX_ALG_IndexParamVideoBufferMode";
+    case OMX_ALG_IndexParamVideoInterlaceFormatCurrent:
+      return "OMX_ALG_IndexParamVideoInterlaceFormatCurrent";
+    case OMX_ALG_IndexParamVideoLongTerm:
+      return "OMX_ALG_IndexParamVideoLongTerm";
+    case OMX_ALG_IndexParamVideoLookAhead:
+      return "OMX_ALG_IndexParamVideoLookAhead";
+    case OMX_ALG_IndexConfigVendorVideoStartUnused:
+      return "OMX_ALG_IndexConfigVendorVideoStartUnused";
+    case OMX_ALG_IndexConfigVideoInsertInstantaneousDecodingRefresh:
+      return "OMX_ALG_IndexConfigVideoInsertInstantaneousDecodingRefresh";
+    case OMX_ALG_IndexConfigVideoGroupOfPictures:
+      return "OMX_ALG_IndexConfigVideoGroupOfPictures";
+    case OMX_ALG_IndexConfigVideoRegionOfInterest:
+      return "OMX_ALG_IndexConfigVideoRegionOfInterest";
+    case OMX_ALG_IndexConfigVideoNotifySceneChange:
+      return "OMX_ALG_IndexConfigVideoNotifySceneChange";
+    case OMX_ALG_IndexConfigVideoInsertLongTerm:
+      return "OMX_ALG_IndexConfigVideoInsertLongTerm";
+    case OMX_ALG_IndexConfigVideoUseLongTerm:
+      return "OMX_ALG_IndexConfigVideoUseLongTerm";
+    case OMX_ALG_IndexVendorCommonStartUnused:
+      return "OMX_ALG_IndexVendorCommonStartUnused";
+    case OMX_ALG_IndexParamCommonSequencePictureModeCurrent:
+      return "OMX_ALG_IndexParamCommonSequencePictureModeCurrent";
+    case OMX_ALG_IndexParamCommonSequencePictureModeQuerySupported:
+      return "OMX_ALG_IndexParamCommonSequencePictureModeQuerySupported";
+    case OMX_ALG_IndexParamVideoTwoPass:
+      return "OMX_ALG_IndexParamVideoTwoPass";
+    case OMX_ALG_IndexParamVideoColorPrimaries:
+      return "OMX_ALG_IndexParamVideoColorPrimaries";
+    case OMX_ALG_IndexParamVideoSkipFrame:
+      return "OMX_ALG_IndexParamVideoSkipFrame";
+    case OMX_ALG_IndexConfigVideoNotifyResolutionChange:
+      return "OMX_ALG_IndexConfigVideoNotifyResolutionChange";
+    case OMX_ALG_IndexConfigVideoInsertPrefixSEI:
+      return "OMX_ALG_IndexConfigVideoInsertPrefixSEI";
+    case OMX_ALG_IndexConfigVideoInsertSuffixSEI:
+      return "OMX_ALG_IndexConfigVideoInsertSuffixSEI";
+    case OMX_ALG_IndexConfigVideoQuantizationParameterTable:
+      return "OMX_ALG_IndexConfigVideoQuantizationParameterTable";
+    case OMX_ALG_IndexParamVideoInputParsed:
+      return "OMX_ALG_IndexParamVideoInputParsed";
+    case OMX_ALG_IndexParamVideoMaxPictureSize:
+      return "OMX_ALG_IndexParamVideoMaxPictureSize";
+    case OMX_ALG_IndexParamVideoMaxPictureSizes:
+      return "OMX_ALG_IndexParamVideoMaxPictureSizes";
+    case OMX_ALG_IndexConfigVideoLoopFilterBeta:
+      return "OMX_ALG_IndexConfigVideoLoopFilterBeta";
+    case OMX_ALG_IndexConfigVideoLoopFilterTc:
+      return "OMX_ALG_IndexConfigVideoLoopFilterTc";
+    case OMX_ALG_IndexParamVideoLoopFilterBeta:
+      return "OMX_ALG_IndexParamVideoLoopFilterBeta";
+    case OMX_ALG_IndexParamVideoLoopFilterTc:
+      return "OMX_ALG_IndexParamVideoLoopFilterTc";
+    case OMX_ALG_IndexPortParamEarlyCallback:
+      return "OMX_ALG_IndexPortParamEarlyCallback";
+    case OMX_ALG_IndexParamVideoTransferCharacteristics:
+      return "OMX_ALG_IndexParamVideoTransferCharacteristics";
+    case OMX_ALG_IndexParamVideoColorMatrix:
+      return "OMX_ALG_IndexParamVideoColorMatrix";
+    case OMX_ALG_IndexConfigVideoTransferCharacteristics:
+      return "OMX_ALG_IndexConfigVideoTransferCharacteristics";
+    case OMX_ALG_IndexConfigVideoColorMatrix:
+      return "OMX_ALG_IndexConfigVideoColorMatrix";
+    case OMX_ALG_IndexConfigVideoHighDynamicRangeSEI:
+      return "OMX_ALG_IndexConfigVideoHighDynamicRangeSEI";
+    case OMX_ALG_IndexConfigVideoMaxResolutionChange:
+      return "OMX_ALG_IndexConfigVideoMaxResolutionChange";
+    case OMX_ALG_IndexParamVideoQuantizationTable:
+      return "OMX_ALG_IndexParamVideoQuantizationTable";
+    case OMX_ALG_IndexParamVideoAccessUnitDelimiter:
+      return "OMX_ALG_IndexParamVideoAccessUnitDelimiter";
+    case OMX_ALG_IndexParamVideoBufferingPeriodSEI:
+      return "OMX_ALG_IndexParamVideoBufferingPeriodSEI";
+    case OMX_ALG_IndexParamVideoPictureTimingSEI:
+      return "OMX_ALG_IndexParamVideoPictureTimingSEI";
+    case OMX_ALG_IndexParamVideoRecoveryPointSEI:
+      return "OMX_ALG_IndexParamVideoRecoveryPointSEI";
+    case OMX_ALG_IndexParamVideoMasteringDisplayColourVolumeSEI:
+      return "OMX_ALG_IndexParamVideoMasteringDisplayColourVolumeSEI";
+    case OMX_ALG_IndexParamVideoContentLightLevelSEI:
+      return "OMX_ALG_IndexParamVideoContentLightLevelSEI";
+    case OMX_ALG_IndexConfigVideoRegionOfInterestByValue:
+      return "OMX_ALG_IndexConfigVideoRegionOfInterestByValue";
+    case OMX_ALG_IndexConfigVideoColorPrimaries:
+      return "OMX_ALG_IndexConfigVideoColorPrimaries";
+    case OMX_ALG_IndexMaxEnum:
+      return "OMX_ALG_IndexMaxEnum";
+  }
+#endif
+
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  /* Not part of the enum in OMX_IndexAlg.h */
+  if (index == OMX_ALG_IndexParamVideoInterlaceFormatSupported)
+    return "OMX_ALG_IndexParamVideoInterlaceFormatSupported";
+#endif
+
+  return NULL;
+}
+#endif /* GST_DISABLE_GST_DEBUG */
+
+static void
+log_omx_api_trace_call (GstOMXComponent * comp, const gchar * function,
+    OMX_INDEXTYPE index, GstDebugLevel level)
+{
+#ifndef GST_DISABLE_GST_DEBUG
+  GstStructure *s;
+  const gchar *index_name;
+
+  /* Don't bother creating useless structs if not needed */
+  if (gst_debug_category_get_threshold (OMX_API_TRACE) < level)
+    return;
+
+  index_name = omx_index_type_to_str (index);
+  if (!index_name) {
+    GST_CAT_WARNING_OBJECT (OMX_API_TRACE, comp->parent,
+        "unknown call of %s with index 0x%08x", function, index);
+    return;
+  }
+
+  s = gst_structure_new (function, "index", G_TYPE_STRING, index_name, NULL);
+  GST_CAT_LEVEL_LOG (OMX_API_TRACE, level, comp->parent, "%" GST_PTR_FORMAT, s);
+  gst_structure_free (s);
+#endif /* GST_DISABLE_GST_DEBUG */
+}
+
 /* comp->lock must be unlocked while calling this */
 OMX_ERRORTYPE
 gst_omx_component_get_parameter (GstOMXComponent * comp, OMX_INDEXTYPE index,
@@ -1130,6 +1909,7 @@ gst_omx_component_get_parameter (GstOMXComponent * comp, OMX_INDEXTYPE index,
 
   GST_DEBUG_OBJECT (comp->parent, "Getting %s parameter at index 0x%08x",
       comp->name, index);
+  log_omx_api_trace_call (comp, "GetParameter", index, GST_LEVEL_LOG);
   err = OMX_GetParameter (comp->handle, index, param);
   DEBUG_IF_OK (comp->parent, err, "Got %s parameter at index 0x%08x: %s "
       "(0x%08x)", comp->name, index, gst_omx_error_to_string (err), err);
@@ -1149,6 +1929,8 @@ gst_omx_component_set_parameter (GstOMXComponent * comp, OMX_INDEXTYPE index,
 
   GST_DEBUG_OBJECT (comp->parent, "Setting %s parameter at index 0x%08x",
       comp->name, index);
+
+  log_omx_api_trace_call (comp, "SetParameter", index, GST_LEVEL_DEBUG);
   err = OMX_SetParameter (comp->handle, index, param);
   DEBUG_IF_OK (comp->parent, err, "Set %s parameter at index 0x%08x: %s "
       "(0x%08x)", comp->name, index, gst_omx_error_to_string (err), err);
@@ -1168,6 +1950,7 @@ gst_omx_component_get_config (GstOMXComponent * comp, OMX_INDEXTYPE index,
 
   GST_DEBUG_OBJECT (comp->parent, "Getting %s configuration at index 0x%08x",
       comp->name, index);
+  log_omx_api_trace_call (comp, "GetConfig", index, GST_LEVEL_LOG);
   err = OMX_GetConfig (comp->handle, index, config);
   DEBUG_IF_OK (comp->parent, err, "Got %s parameter at index 0x%08x: %s "
       "(0x%08x)", comp->name, index, gst_omx_error_to_string (err), err);
@@ -1187,6 +1970,7 @@ gst_omx_component_set_config (GstOMXComponent * comp, OMX_INDEXTYPE index,
 
   GST_DEBUG_OBJECT (comp->parent, "Setting %s configuration at index 0x%08x",
       comp->name, index);
+  log_omx_api_trace_call (comp, "SetConfig", index, GST_LEVEL_DEBUG);
   err = OMX_SetConfig (comp->handle, index, config);
   DEBUG_IF_OK (comp->parent, err, "Set %s parameter at index 0x%08x: %s "
       "(0x%08x)", comp->name, index, gst_omx_error_to_string (err), err);
@@ -1340,7 +2124,8 @@ gst_omx_port_update_port_definition (GstOMXPort * port,
 
 /* NOTE: Uses comp->lock and comp->messages_lock */
 GstOMXAcquireBufferReturn
-gst_omx_port_acquire_buffer (GstOMXPort * port, GstOMXBuffer ** buf)
+gst_omx_port_acquire_buffer (GstOMXPort * port, GstOMXBuffer ** buf,
+    GstOMXWait wait)
 {
   GstOMXAcquireBufferReturn ret = GST_OMX_ACQUIRE_BUFFER_ERROR;
   GstOMXComponent *comp;
@@ -1438,7 +2223,8 @@ retry:
   if (port->port_def.eDir == OMX_DirOutput && port->eos) {
     if (!g_queue_is_empty (&port->pending_buffers)) {
       GST_DEBUG_OBJECT (comp->parent, "%s output port %u is EOS but has "
-          "buffers pending", comp->name, port->index);
+          "%d buffers pending", comp->name, port->index,
+          g_queue_get_length (&port->pending_buffers));
       _buf = g_queue_pop_head (&port->pending_buffers);
 
       ret = GST_OMX_ACQUIRE_BUFFER_OK;
@@ -1472,11 +2258,17 @@ retry:
   if (g_queue_is_empty (&port->pending_buffers)) {
     GST_DEBUG_OBJECT (comp->parent, "Queue of %s port %u is empty",
         comp->name, port->index);
-    gst_omx_component_wait_message (comp,
-        timeout == -2 ? GST_CLOCK_TIME_NONE : timeout);
 
-    /* And now check everything again and maybe get a buffer */
-    goto retry;
+    if (wait == GST_OMX_WAIT) {
+      gst_omx_component_wait_message (comp,
+          timeout == -2 ? GST_CLOCK_TIME_NONE : timeout);
+
+      /* And now check everything again and maybe get a buffer */
+      goto retry;
+    } else {
+      ret = GST_OMX_ACQUIRE_BUFFER_NO_AVAILABLE;
+      goto done;
+    }
   }
 
   GST_DEBUG_OBJECT (comp->parent, "%s port %u has pending buffers",
@@ -1552,10 +2344,10 @@ gst_omx_port_release_buffer (GstOMXPort * port, GstOMXBuffer * buf)
   buf->used = TRUE;
 
   if (port->port_def.eDir == OMX_DirInput) {
-    log_omx_performance (comp, "EmptyThisBuffer", buf);
+    log_omx_api_trace_buffer (comp, "EmptyThisBuffer", buf);
     err = OMX_EmptyThisBuffer (comp->handle, buf->omx_buf);
   } else {
-    log_omx_performance (comp, "FillThisBuffer", buf);
+    log_omx_api_trace_buffer (comp, "FillThisBuffer", buf);
     err = OMX_FillThisBuffer (comp->handle, buf->omx_buf);
   }
   DEBUG_IF_OK (comp->parent, err, "Released buffer %p to %s port %u: %s "
@@ -1611,7 +2403,7 @@ gst_omx_port_set_flushing (GstOMXPort * port, GstClockTime timeout,
 
   gst_omx_component_handle_messages (comp);
 
-  if (! !flush == ! !port->flushing) {
+  if (flush == port->flushing) {
     GST_DEBUG_OBJECT (comp->parent, "%s port %u was %sflushing already",
         comp->name, port->index, (flush ? "" : "not "));
     goto done;
@@ -1633,7 +2425,9 @@ gst_omx_port_set_flushing (GstOMXPort * port, GstClockTime timeout,
     /* Now flush the port */
     port->flushed = FALSE;
 
-    err = OMX_SendCommand (comp->handle, OMX_CommandFlush, port->index, NULL);
+    err =
+        gst_omx_component_send_command (comp, OMX_CommandFlush, port->index,
+        NULL);
 
     if (err != OMX_ErrorNone) {
       GST_ERROR_OBJECT (comp->parent,
@@ -1649,7 +2443,7 @@ gst_omx_port_set_flushing (GstOMXPort * port, GstClockTime timeout,
       goto done;
     }
 
-    if (! !port->flushing != ! !flush) {
+    if (port->flushing != flush) {
       GST_ERROR_OBJECT (comp->parent, "%s: another flush happened in the "
           " meantime", comp->name);
       goto done;
@@ -2184,11 +2978,11 @@ gst_omx_port_set_enabled_unlocked (GstOMXPort * port, gboolean enabled)
 
   if (enabled)
     err =
-        OMX_SendCommand (comp->handle, OMX_CommandPortEnable, port->index,
-        NULL);
+        gst_omx_component_send_command (comp, OMX_CommandPortEnable,
+        port->index, NULL);
   else
     err =
-        OMX_SendCommand (comp->handle, OMX_CommandPortDisable,
+        gst_omx_component_send_command (comp, OMX_CommandPortDisable,
         port->index, NULL);
 
   if (err != OMX_ErrorNone) {
@@ -2300,6 +3094,17 @@ gst_omx_port_wait_buffers_released (GstOMXPort * port, GstClockTime timeout)
   return err;
 }
 
+void
+gst_omx_port_requeue_buffer (GstOMXPort * port, GstOMXBuffer * buf)
+{
+  g_mutex_lock (&port->comp->lock);
+  g_queue_push_tail (&port->pending_buffers, buf);
+  g_mutex_unlock (&port->comp->lock);
+
+  /* awake gst_omx_port_acquire_buffer() */
+  gst_omx_component_send_message (port->comp, NULL);
+}
+
 /* NOTE: Uses comp->lock and comp->messages_lock */
 OMX_ERRORTYPE
 gst_omx_port_set_enabled (GstOMXPort * port, gboolean enabled)
@@ -2356,7 +3161,7 @@ gst_omx_port_populate_unlocked (GstOMXPort * port)
        */
       gst_omx_buffer_reset (buf);
 
-      log_omx_performance (comp, "FillThisBuffer", buf);
+      log_omx_api_trace_buffer (comp, "FillThisBuffer", buf);
       err = OMX_FillThisBuffer (comp->handle, buf->omx_buf);
 
       if (err != OMX_ErrorNone) {
@@ -2559,6 +3364,151 @@ done:
   g_mutex_unlock (&comp->lock);
 
   return err;
+}
+
+/* The OMX specs states that the nBufferCountActual of a port has to default
+ * to its nBufferCountMin. If we don't change nBufferCountActual we purely rely
+ * on this default. But in some cases, OMX may change nBufferCountMin before we
+ * allocate buffers. Like for example when configuring the input ports with the
+ * actual format, it may decrease the number of minimal buffers required.
+ * This method checks this and update nBufferCountActual if needed so we'll use
+ * less buffers than the worst case in such scenarios.
+ */
+gboolean
+gst_omx_port_ensure_buffer_count_actual (GstOMXPort * port, guint extra)
+{
+  OMX_PARAM_PORTDEFINITIONTYPE port_def;
+  guint nb;
+
+  gst_omx_port_get_port_definition (port, &port_def);
+
+  nb = port_def.nBufferCountMin + extra;
+  if (port_def.nBufferCountActual != nb) {
+    port_def.nBufferCountActual = nb;
+
+    GST_DEBUG_OBJECT (port->comp->parent,
+        "set port %d nBufferCountActual to %d", (guint) port->index, nb);
+
+    if (gst_omx_port_update_port_definition (port, &port_def) != OMX_ErrorNone)
+      return FALSE;
+  }
+
+  return TRUE;
+}
+
+gboolean
+gst_omx_port_update_buffer_count_actual (GstOMXPort * port, guint nb)
+{
+  OMX_PARAM_PORTDEFINITIONTYPE port_def;
+
+  gst_omx_port_get_port_definition (port, &port_def);
+
+  if (nb < port_def.nBufferCountMin) {
+    GST_DEBUG_OBJECT (port->comp->parent,
+        "Requested to use %d buffers on port %d but it's minimum is %d", nb,
+        (guint) port->index, (guint) port_def.nBufferCountMin);
+
+    nb = port_def.nBufferCountMin;
+  }
+
+  if (port_def.nBufferCountActual != nb) {
+    port_def.nBufferCountActual = nb;
+
+    GST_DEBUG_OBJECT (port->comp->parent,
+        "set port %d nBufferCountActual to %d", (guint) port->index, nb);
+
+    if (gst_omx_port_update_port_definition (port, &port_def) != OMX_ErrorNone)
+      return FALSE;
+  }
+
+  return TRUE;
+}
+
+gboolean
+gst_omx_port_set_dmabuf (GstOMXPort * port, gboolean dmabuf)
+{
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  OMX_ALG_PORT_PARAM_BUFFER_MODE buffer_mode;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&buffer_mode);
+  buffer_mode.nPortIndex = port->index;
+
+  if (dmabuf)
+    buffer_mode.eMode = OMX_ALG_BUF_DMA;
+  else
+    buffer_mode.eMode = OMX_ALG_BUF_NORMAL;
+
+  err =
+      gst_omx_component_set_parameter (port->comp,
+      (OMX_INDEXTYPE) OMX_ALG_IndexPortParamBufferMode, &buffer_mode);
+  if (err != OMX_ErrorNone) {
+    GST_WARNING_OBJECT (port->comp->parent,
+        "Failed to set port %d in %sdmabuf mode: %s (0x%08x)",
+        port->index, dmabuf ? "" : "non-", gst_omx_error_to_string (err), err);
+    return FALSE;
+  }
+
+  return TRUE;
+#else
+  /* dmabuf not supported for this platform */
+  return FALSE;
+#endif
+}
+
+gboolean
+gst_omx_port_set_subframe (GstOMXPort * port, gboolean enabled)
+{
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  OMX_ALG_VIDEO_PARAM_SUBFRAME subframe_mode;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&subframe_mode);
+  subframe_mode.nPortIndex = port->index;
+
+  subframe_mode.bEnableSubframe = enabled;
+
+  err = gst_omx_component_set_parameter (port->comp,
+      (OMX_INDEXTYPE) OMX_ALG_IndexParamVideoSubframe, &subframe_mode);
+  if (err != OMX_ErrorNone) {
+    GST_WARNING_OBJECT (port->comp->parent,
+        "Failed to %s subframe mode on port %d: %s (0x%08x)",
+        enabled ? "enable" : "disable", port->index,
+        gst_omx_error_to_string (err), err);
+    return FALSE;
+  }
+
+  return TRUE;
+#else
+  /* subframe mode is not supported on this platform */
+  return FALSE;
+#endif
+}
+
+gboolean
+gst_omx_port_get_subframe (GstOMXPort * port)
+{
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  OMX_ALG_VIDEO_PARAM_SUBFRAME subframe_mode;
+  OMX_ERRORTYPE err;
+
+  GST_OMX_INIT_STRUCT (&subframe_mode);
+  subframe_mode.nPortIndex = port->index;
+
+  err = gst_omx_component_get_parameter (port->comp,
+      (OMX_INDEXTYPE) OMX_ALG_IndexParamVideoSubframe, &subframe_mode);
+  if (err != OMX_ErrorNone) {
+    GST_WARNING_OBJECT (port->comp->parent,
+        "Failed to get subframe mode on port %d: %s (0x%08x)",
+        port->index, gst_omx_error_to_string (err), err);
+    return FALSE;
+  }
+
+  return subframe_mode.bEnableSubframe;
+#else
+  /* subframe mode is not supported on this platform */
+  return FALSE;
+#endif
 }
 
 typedef GType (*GGetTypeFunction) (void);
@@ -2782,6 +3732,10 @@ struct BufferFlagString buffer_flags_map[] = {
 #ifdef OMX_BUFFERFLAG_SKIPFRAME
   {OMX_BUFFERFLAG_SKIPFRAME, "skip-frame"},
 #endif
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  {OMX_ALG_BUFFERFLAG_TOP_FIELD, "top-field"},
+  {OMX_ALG_BUFFERFLAG_BOT_FIELD, "bottom-field"},
+#endif
   {0, NULL},
 };
 
@@ -2876,6 +3830,8 @@ gst_omx_parse_hacks (gchar ** hacks)
       hacks_flags |= GST_OMX_HACK_PASS_PROFILE_TO_DECODER;
     else if (g_str_equal (*hacks, "pass-color-format-to-decoder"))
       hacks_flags |= GST_OMX_HACK_PASS_COLOR_FORMAT_TO_DECODER;
+    else if (g_str_equal (*hacks, "ensure-buffer-count-actual"))
+      hacks_flags |= GST_OMX_HACK_ENSURE_BUFFER_COUNT_ACTUAL;
     else
       GST_WARNING ("Unknown hack: %s", *hacks);
     hacks++;
@@ -3060,7 +4016,7 @@ plugin_init (GstPlugin * plugin)
   GST_DEBUG_CATEGORY_INIT (gstomx_debug, "omx", 0, "gst-omx");
   GST_DEBUG_CATEGORY_INIT (gst_omx_video_debug_category, "omxvideo", 0,
       "gst-omx-video");
-  GST_DEBUG_CATEGORY_INIT (OMX_PERFORMANCE, "OMX_PERFORMANCE", 0,
+  GST_DEBUG_CATEGORY_INIT (OMX_API_TRACE, "OMX_API_TRACE", 0,
       "gst-omx performace");
 
   /* Read configuration file gstomx.conf from the preferred
@@ -3088,14 +4044,23 @@ plugin_init (GstPlugin * plugin)
   config = g_key_file_new ();
   if (!g_key_file_load_from_dirs (config, *config_name,
           (const gchar **) config_dirs, NULL, G_KEY_FILE_NONE, &err)) {
-    gchar *paths;
+#ifdef USE_OMX_TARGET_GENERIC
+    GST_INFO ("No configuration file found; "
+        "ignore as gst-omx has been built with the generic target used only for testing");
+#else
+    {
+      gchar *paths;
 
-    paths = g_strjoinv (":", config_dirs);
-    GST_ERROR ("Failed to load configuration file: %s (searched in: %s as per "
-        "GST_OMX_CONFIG_DIR environment variable, the xdg user config "
-        "directory (or XDG_CONFIG_HOME) and the system config directory "
-        "(or XDG_CONFIG_DIRS)", err->message, paths);
-    g_free (paths);
+      paths = g_strjoinv (":", config_dirs);
+      GST_ERROR
+          ("Failed to load configuration file: %s (searched in: %s as per "
+          "GST_OMX_CONFIG_DIR environment variable, the xdg user config "
+          "directory (or XDG_CONFIG_HOME) and the system config directory "
+          "(or XDG_CONFIG_DIRS)", err->message, paths);
+      g_free (paths);
+    }
+#endif /* USE_OMX_TARGET_GENERIC */
+
     g_error_free (err);
     goto done;
   }

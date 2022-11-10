@@ -33,6 +33,7 @@
 GST_DEBUG_CATEGORY (gst_omx_video_debug_category);
 #define GST_CAT_DEFAULT gst_omx_video_debug_category
 
+/* Keep synced with GST_OMX_VIDEO_DEC_SUPPORTED_FORMATS */
 GstVideoFormat
 gst_omx_video_get_format_from_omx (OMX_COLOR_FORMATTYPE omx_colorformat)
 {
@@ -141,13 +142,13 @@ gst_omx_video_get_supported_colorformats (GstOMXPort * port,
         m->type = param.eColorFormat;
         negotiation_map = g_list_append (negotiation_map, m);
         GST_DEBUG_OBJECT (comp->parent,
-            "Component supports %s (%d) at index %u",
+            "Component port %d supports %s (%d) at index %u", port->index,
             gst_video_format_to_string (f), param.eColorFormat,
             (guint) param.nIndex);
       } else {
         GST_DEBUG_OBJECT (comp->parent,
-            "Component supports unsupported color format %d at index %u",
-            param.eColorFormat, (guint) param.nIndex);
+            "Component port %d supports unsupported color format %d at index %u",
+            port->index, param.eColorFormat, (guint) param.nIndex);
       }
     }
     old_index = param.nIndex++;
@@ -180,7 +181,8 @@ gst_omx_video_negotiation_map_free (GstOMXVideoNegotiationMap * m)
 }
 
 GstVideoCodecFrame *
-gst_omx_video_find_nearest_frame (GstOMXBuffer * buf, GList * frames)
+gst_omx_video_find_nearest_frame (GstElement * element, GstOMXBuffer * buf,
+    GList * frames)
 {
   GstVideoCodecFrame *best = NULL;
   GstClockTimeDiff best_diff = G_MAXINT64;
@@ -191,9 +193,16 @@ gst_omx_video_find_nearest_frame (GstOMXBuffer * buf, GList * frames)
       gst_util_uint64_scale (GST_OMX_GET_TICKS (buf->omx_buf->nTimeStamp),
       GST_SECOND, OMX_TICKS_PER_SECOND);
 
+  GST_LOG_OBJECT (element, "look for ts %" GST_TIME_FORMAT,
+      GST_TIME_ARGS (timestamp));
+
   for (l = frames; l; l = l->next) {
     GstVideoCodecFrame *tmp = l->data;
     GstClockTimeDiff diff = ABS (GST_CLOCK_DIFF (timestamp, tmp->pts));
+
+    GST_LOG_OBJECT (element,
+        "  frame %u diff %" G_GINT64_FORMAT " ts %" GST_TIME_FORMAT,
+        tmp->system_frame_number, diff, GST_TIME_ARGS (tmp->pts));
 
     if (diff < best_diff) {
       best = tmp;
@@ -204,8 +213,20 @@ gst_omx_video_find_nearest_frame (GstOMXBuffer * buf, GList * frames)
     }
   }
 
-  if (best)
+  if (best) {
     gst_video_codec_frame_ref (best);
+
+    /* OMX timestamps are in microseconds while gst ones are in nanoseconds.
+     * So if the difference between them is higher than 1 microsecond we likely
+     * picked the wrong frame. */
+    if (best_diff >= GST_USECOND)
+      GST_WARNING_OBJECT (element,
+          "Difference between ts (%" GST_TIME_FORMAT ") and frame %u (%"
+          GST_TIME_FORMAT ") seems too high (%" GST_TIME_FORMAT ")",
+          GST_TIME_ARGS (timestamp), best->system_frame_number,
+          GST_TIME_ARGS (best->pts), GST_TIME_ARGS (best_diff));
+  } else
+    GST_WARNING_OBJECT (element, "No best frame has been found");
 
   g_list_foreach (frames, (GFunc) gst_video_codec_frame_unref, NULL);
   g_list_free (frames);
@@ -218,7 +239,13 @@ gst_omx_video_calculate_framerate_q16 (GstVideoInfo * info)
 {
   g_assert (info);
 
-  return gst_util_uint64_scale_int (1 << 16, info->fps_n, info->fps_d);
+  if (!info->fps_d)
+    return 0;
+
+  /* OMX API expects frame rate to actually be the field rate, so twice
+   * the frame rate in interlace mode. */
+  return gst_util_uint64_scale_int (1 << 16, GST_VIDEO_INFO_FIELD_RATE_N (info),
+      info->fps_d);
 }
 
 gboolean
@@ -233,4 +260,97 @@ gst_omx_video_is_equal_framerate_q16 (OMX_U32 q16_a, OMX_U32 q16_b)
   /* If the 'percentage change' is less than 1% then consider it equal to avoid
    * an unnecessary re-negotiation. */
   return fabs (((gdouble) q16_a) - ((gdouble) q16_b)) / (gdouble) q16_b < 0.01;
+}
+
+gboolean
+gst_omx_video_get_port_padding (GstOMXPort * port, GstVideoInfo * info_orig,
+    GstVideoAlignment * align)
+{
+  guint nstride;
+  guint nslice_height;
+  GstVideoInfo info;
+  gsize plane_size[GST_VIDEO_MAX_PLANES];
+
+  gst_video_alignment_reset (align);
+
+  /* Create a copy of @info_orig without any offset/stride as we need a
+   * 'standard' version to compute the paddings. */
+  gst_video_info_init (&info);
+  gst_video_info_set_interlaced_format (&info,
+      GST_VIDEO_INFO_FORMAT (info_orig),
+      GST_VIDEO_INFO_INTERLACE_MODE (info_orig),
+      GST_VIDEO_INFO_WIDTH (info_orig), GST_VIDEO_INFO_HEIGHT (info_orig));
+
+  /* Retrieve the plane sizes */
+  if (!gst_video_info_align_full (&info, align, plane_size)) {
+    GST_WARNING_OBJECT (port->comp->parent, "Failed to retrieve plane sizes");
+    return FALSE;
+  }
+
+  nstride = port->port_def.format.video.nStride;
+  nslice_height = port->port_def.format.video.nSliceHeight;
+
+  if (nstride > GST_VIDEO_INFO_PLANE_STRIDE (&info, 0)) {
+    align->padding_right = nstride - GST_VIDEO_INFO_PLANE_STRIDE (&info, 0);
+
+    if (GST_VIDEO_FORMAT_INFO_IS_COMPLEX (info.finfo)) {
+      /* Stride is in bytes while padding is in pixels so we need to do manual
+       * conversions for complex formats. */
+      switch (GST_VIDEO_INFO_FORMAT (&info)) {
+        case GST_VIDEO_FORMAT_NV12_10LE32:
+        case GST_VIDEO_FORMAT_NV16_10LE32:
+          /* Need ((width + 2) / 3) 32-bits words to store one row,
+           * see unpack_NV12_10LE32 in -base.
+           *
+           * So let's say:
+           * - W = the width, in pixels
+           * - S = the stride, in bytes
+           * - P = the padding, in bytes
+           * - Δ = the padding, in pixels
+           *
+           * we then have:
+           * S = ((W+2)/3) * 4
+           * S+P = ((W+2+Δ)/3) * 4
+           *
+           * By solving this system we get:
+           * Δ = (3/4) * P
+           */
+          align->padding_right *= 0.75;
+          break;
+        default:
+          GST_FIXME_OBJECT (port->comp->parent,
+              "Stride conversion is not supported for format %s",
+              GST_VIDEO_INFO_NAME (&info));
+          return FALSE;
+      }
+    }
+
+    GST_LOG_OBJECT (port->comp->parent,
+        "OMX stride (%d) is higher than standard (%d) for port %u; right padding: %d",
+        nstride, GST_VIDEO_INFO_PLANE_STRIDE (&info, 0), port->index,
+        align->padding_right);
+  }
+
+  if (nslice_height > GST_VIDEO_INFO_PLANE_HEIGHT (&info, 0, plane_size)) {
+    align->padding_bottom =
+        nslice_height - GST_VIDEO_INFO_PLANE_HEIGHT (&info, 0, plane_size);
+
+    if (GST_VIDEO_INFO_INTERLACE_MODE (&info) ==
+        GST_VIDEO_INTERLACE_MODE_ALTERNATE) {
+      /* GstVideoAlignment defines the alignment for the full frame while
+       * OMX gives us the slice height for a single field, so we have to
+       * double the vertical padding. */
+      GST_DEBUG_OBJECT (port->comp->parent,
+          "Double bottom padding because of alternate stream");
+      align->padding_bottom *= 2;
+    }
+
+    GST_LOG_OBJECT (port->comp->parent,
+        "OMX slice height (%d) is higher than standard (%" G_GSIZE_FORMAT
+        ") for port %u; vertical padding: %d", nslice_height,
+        GST_VIDEO_INFO_PLANE_HEIGHT (&info, 0, plane_size), port->index,
+        align->padding_bottom);
+  }
+
+  return TRUE;
 }

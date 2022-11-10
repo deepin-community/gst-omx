@@ -24,26 +24,60 @@
 
 #include "gstomxh264utils.h"
 
+typedef struct
+{
+  const gchar *profile;
+  OMX_VIDEO_AVCPROFILETYPE e;
+} H264ProfileMapping;
+
+static const H264ProfileMapping h264_profiles[] = {
+  {"baseline", OMX_VIDEO_AVCProfileBaseline},
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  {"constrained-baseline",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileConstrainedBaseline},
+#else
+  {"constrained-baseline", OMX_VIDEO_AVCProfileBaseline},
+#endif
+  {"main", OMX_VIDEO_AVCProfileMain},
+  {"high", OMX_VIDEO_AVCProfileHigh},
+  {"high-10", OMX_VIDEO_AVCProfileHigh10},
+  {"high-4:2:2", OMX_VIDEO_AVCProfileHigh422},
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+  {"progressive-high",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileProgressiveHigh},
+  {"constrained-high",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileConstrainedHigh},
+  {"high-10-intra",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileHigh10_Intra},
+  {"high-4:2:2-intra",
+      (OMX_VIDEO_AVCPROFILETYPE) OMX_ALG_VIDEO_AVCProfileHigh422_Intra},
+#endif
+};
+
 OMX_VIDEO_AVCPROFILETYPE
 gst_omx_h264_utils_get_profile_from_str (const gchar * profile)
 {
-  if (g_str_equal (profile, "baseline")) {
-    return OMX_VIDEO_AVCProfileBaseline;
-  } else if (g_str_equal (profile, "main")) {
-    return OMX_VIDEO_AVCProfileMain;
-  } else if (g_str_equal (profile, "extended")) {
-    return OMX_VIDEO_AVCProfileExtended;
-  } else if (g_str_equal (profile, "high")) {
-    return OMX_VIDEO_AVCProfileHigh;
-  } else if (g_str_equal (profile, "high-10")) {
-    return OMX_VIDEO_AVCProfileHigh10;
-  } else if (g_str_equal (profile, "high-4:2:2")) {
-    return OMX_VIDEO_AVCProfileHigh422;
-  } else if (g_str_equal (profile, "high-4:4:4")) {
-    return OMX_VIDEO_AVCProfileHigh444;
+  guint i;
+
+  for (i = 0; i < G_N_ELEMENTS (h264_profiles); i++) {
+    if (g_str_equal (profile, h264_profiles[i].profile))
+      return h264_profiles[i].e;
   }
 
   return OMX_VIDEO_AVCProfileMax;
+}
+
+const gchar *
+gst_omx_h264_utils_get_profile_from_enum (OMX_VIDEO_AVCPROFILETYPE e)
+{
+  guint i;
+
+  for (i = 0; i < G_N_ELEMENTS (h264_profiles); i++) {
+    if (e == h264_profiles[i].e)
+      return h264_profiles[i].profile;
+  }
+
+  return NULL;
 }
 
 OMX_VIDEO_AVCLEVELTYPE

@@ -1,5 +1,6 @@
 omx_sources = [
   'gstomx.c',
+  'gstomxallocator.c',
   'gstomxbufferpool.c',
   'gstomxvideo.c',
   'gstomxvideodec.c',
@@ -58,3 +59,5 @@ gstomx = library('gstomx',
   install : true,
   install_dir : plugins_install_dir,
 )
+
+plugins = [gstomx]
