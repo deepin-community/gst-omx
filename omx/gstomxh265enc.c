@@ -27,6 +27,7 @@
 
 #include "gstomxh265enc.h"
 #include "gstomxh265utils.h"
+#include "gstomxvideo.h"
 
 GST_DEBUG_CATEGORY_STATIC (gst_omx_h265_enc_debug_category);
 #define GST_CAT_DEFAULT gst_omx_h265_enc_debug_category
@@ -40,6 +41,8 @@ static void gst_omx_h265_enc_set_property (GObject * object, guint prop_id,
     const GValue * value, GParamSpec * pspec);
 static void gst_omx_h265_enc_get_property (GObject * object, guint prop_id,
     GValue * value, GParamSpec * pspec);
+static GstFlowReturn gst_omx_h265_enc_handle_output_frame (GstOMXVideoEnc *
+    self, GstOMXPort * port, GstOMXBuffer * buf, GstVideoCodecFrame * frame);
 
 enum
 {
@@ -60,8 +63,10 @@ enum
 #ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
 /* zynqultrascaleplus's OMX uses a param struct different of Android's one */
 #define INDEX_PARAM_VIDEO_HEVC OMX_ALG_IndexParamVideoHevc
+#define ALIGNMENT "{ au, nal }"
 #else
 #define INDEX_PARAM_VIDEO_HEVC OMX_IndexParamVideoHevc
+#define ALIGNMENT "au"
 #endif
 
 /* class initialization */
@@ -104,15 +109,43 @@ gst_omx_h265_enc_loop_filter_mode_get_type (void)
 }
 #endif
 
+static gboolean
+gst_omx_h265_enc_flush (GstVideoEncoder * enc)
+{
+  GstOMXH265Enc *self = GST_OMX_H265_ENC (enc);
+
+  g_list_free_full (self->headers, (GDestroyNotify) gst_buffer_unref);
+  self->headers = NULL;
+
+  return GST_VIDEO_ENCODER_CLASS (parent_class)->flush (enc);
+}
+
+static gboolean
+gst_omx_h265_enc_stop (GstVideoEncoder * enc)
+{
+  GstOMXH265Enc *self = GST_OMX_H265_ENC (enc);
+
+  g_list_free_full (self->headers, (GDestroyNotify) gst_buffer_unref);
+  self->headers = NULL;
+
+  return GST_VIDEO_ENCODER_CLASS (parent_class)->stop (enc);
+}
+
 static void
 gst_omx_h265_enc_class_init (GstOMXH265EncClass * klass)
 {
   GObjectClass *gobject_class = G_OBJECT_CLASS (klass);
   GstElementClass *element_class = GST_ELEMENT_CLASS (klass);
+  GstVideoEncoderClass *basevideoenc_class = GST_VIDEO_ENCODER_CLASS (klass);
   GstOMXVideoEncClass *videoenc_class = GST_OMX_VIDEO_ENC_CLASS (klass);
 
   videoenc_class->set_format = GST_DEBUG_FUNCPTR (gst_omx_h265_enc_set_format);
   videoenc_class->get_caps = GST_DEBUG_FUNCPTR (gst_omx_h265_enc_get_caps);
+  videoenc_class->handle_output_frame =
+      GST_DEBUG_FUNCPTR (gst_omx_h265_enc_handle_output_frame);
+
+  basevideoenc_class->flush = gst_omx_h265_enc_flush;
+  basevideoenc_class->stop = gst_omx_h265_enc_stop;
 
   gobject_class->set_property = gst_omx_h265_enc_set_property;
   gobject_class->get_property = gst_omx_h265_enc_get_property;
@@ -162,14 +195,22 @@ gst_omx_h265_enc_class_init (GstOMXH265EncClass * klass)
           GST_PARAM_MUTABLE_READY));
 #endif
 
+  videoenc_class->cdata.default_sink_template_caps =
+#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
+      GST_VIDEO_CAPS_MAKE_WITH_FEATURES (GST_CAPS_FEATURE_FORMAT_INTERLACED,
+      GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS)
+      ", interlace-mode = (string) alternate ; "
+#endif
+      GST_VIDEO_CAPS_MAKE (GST_OMX_VIDEO_ENC_SUPPORTED_FORMATS);
+
   videoenc_class->cdata.default_src_template_caps = "video/x-h265, "
       "width=(int) [ 1, MAX ], " "height=(int) [ 1, MAX ], "
-      "framerate = (fraction) [0, MAX], "
-      "stream-format=(string) byte-stream, alignment=(string) au ";
+      "framerate = (fraction) [0, MAX], stream-format=(string) byte-stream, "
+      "aligmment = (string) " ALIGNMENT;
 
   gst_element_class_set_static_metadata (element_class,
       "OpenMAX H.265 Video Encoder",
-      "Codec/Encoder/Video",
+      "Codec/Encoder/Video/Hardware",
       "Encode H.265 video streams",
       "Sebastian Dröge <sebastian.droege@collabora.co.uk>");
 
@@ -446,6 +487,7 @@ gst_omx_h265_enc_set_format (GstOMXVideoEnc * enc, GstOMXPort * port,
   const gchar *profile_string, *level_string, *tier_string;
   OMX_VIDEO_HEVCPROFILETYPE profile = OMX_VIDEO_HEVCProfileUnknown;
   OMX_VIDEO_HEVCLEVELTYPE level = OMX_VIDEO_HEVCLevelUnknown;
+  gboolean enable_subframe = FALSE;
 
 #ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
   if (self->periodicity_idr !=
@@ -468,6 +510,7 @@ gst_omx_h265_enc_set_format (GstOMXVideoEnc * enc, GstOMXPort * port,
       gst_pad_get_pad_template_caps (GST_VIDEO_ENCODER_SRC_PAD (enc)));
   if (peercaps) {
     GstStructure *s;
+    const gchar *alignment_string;
 
     if (gst_caps_is_empty (peercaps)) {
       gst_caps_unref (peercaps);
@@ -491,20 +534,11 @@ gst_omx_h265_enc_set_format (GstOMXVideoEnc * enc, GstOMXPort * port,
         goto unsupported_level;
     }
 
+    alignment_string = gst_structure_get_string (s, "alignment");
+    if (alignment_string && g_str_equal (alignment_string, "nal"))
+      enable_subframe = TRUE;
+
     gst_caps_unref (peercaps);
-  }
-
-  /* Change default profile to main-10 if input is 10 bits */
-  if (profile == OMX_VIDEO_HEVCProfileUnknown) {
-    GstVideoFormat format;
-
-    format = state->info.finfo->format;
-    if (format == GST_VIDEO_FORMAT_NV12_10LE32 ||
-        format == GST_VIDEO_FORMAT_NV16_10LE32) {
-      GST_DEBUG_OBJECT (self,
-          "Set profile to main-10 as input is a 10 bits format");
-      profile = OMX_VIDEO_HEVCProfileMain10;
-    }
   }
 
   if (profile != OMX_VIDEO_HEVCProfileUnknown
@@ -518,6 +552,9 @@ gst_omx_h265_enc_set_format (GstOMXVideoEnc * enc, GstOMXPort * port,
 
   if (!update_param_hevc (self, profile, level))
     return FALSE;
+
+  gst_omx_port_set_subframe (GST_OMX_VIDEO_ENC (self)->enc_out_port,
+      enable_subframe);
 
   return TRUE;
 
@@ -540,7 +577,7 @@ gst_omx_h265_enc_get_caps (GstOMXVideoEnc * enc, GstOMXPort * port,
   GstCaps *caps;
   OMX_ERRORTYPE err;
   OMX_VIDEO_PARAM_PROFILELEVELTYPE param;
-  const gchar *profile, *level, *tier;
+  const gchar *profile, *level, *tier, *alignment;
 
   GST_OMX_INIT_STRUCT (&param);
   param.nPortIndex = GST_OMX_VIDEO_ENC (self)->enc_out_port->index;
@@ -551,33 +588,21 @@ gst_omx_h265_enc_get_caps (GstOMXVideoEnc * enc, GstOMXPort * port,
   if (err != OMX_ErrorNone && err != OMX_ErrorUnsupportedIndex)
     return NULL;
 
+  if (gst_omx_port_get_subframe (GST_OMX_VIDEO_ENC (self)->enc_out_port))
+    alignment = "nal";
+  else
+    alignment = "au";
+
   caps = gst_caps_new_simple ("video/x-h265",
       "stream-format", G_TYPE_STRING, "byte-stream",
-      "alignment", G_TYPE_STRING, "au", NULL);
+      "alignment", G_TYPE_STRING, alignment, NULL);
 
   if (err == OMX_ErrorNone) {
-    switch (param.eProfile) {
-      case OMX_VIDEO_HEVCProfileMain:
-        profile = "main";
-        break;
-      case OMX_VIDEO_HEVCProfileMain10:
-        profile = "main-10";
-        break;
-#ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
-      case OMX_ALG_VIDEO_HEVCProfileMainStill:
-        profile = "main-still-picture";
-        break;
-      case OMX_ALG_VIDEO_HEVCProfileMain422:
-        profile = "main-422";
-        break;
-      case OMX_ALG_VIDEO_HEVCProfileMain422_10:
-        profile = "main-422-10";
-        break;
-#endif
-      default:
-        g_assert_not_reached ();
-        gst_caps_unref (caps);
-        return NULL;
+    profile = gst_omx_h265_utils_get_profile_from_enum (param.eProfile);
+    if (!profile) {
+      g_assert_not_reached ();
+      gst_caps_unref (caps);
+      return NULL;
     }
 
     switch (param.eLevel) {
@@ -677,4 +702,47 @@ gst_omx_h265_enc_get_caps (GstOMXVideoEnc * enc, GstOMXPort * port,
   }
 
   return caps;
+}
+
+static GstFlowReturn
+gst_omx_h265_enc_handle_output_frame (GstOMXVideoEnc * enc, GstOMXPort * port,
+    GstOMXBuffer * buf, GstVideoCodecFrame * frame)
+{
+  GstOMXH265Enc *self = GST_OMX_H265_ENC (enc);
+
+  if (buf->omx_buf->nFlags & OMX_BUFFERFLAG_CODECCONFIG) {
+    /* The codec data is SPS/PPS but our output is stream-format=byte-stream.
+     * For bytestream stream format the SPS/PPS is only in-stream and not
+     * in the caps!
+     */
+    GstBuffer *hdrs;
+    GstMapInfo map = GST_MAP_INFO_INIT;
+    GstFlowReturn flow_ret;
+
+    GST_DEBUG_OBJECT (self, "got codecconfig in byte-stream format");
+
+    hdrs = gst_buffer_new_and_alloc (buf->omx_buf->nFilledLen);
+    GST_BUFFER_FLAG_SET (hdrs, GST_BUFFER_FLAG_HEADER);
+
+    gst_buffer_map (hdrs, &map, GST_MAP_WRITE);
+    memcpy (map.data,
+        buf->omx_buf->pBuffer + buf->omx_buf->nOffset,
+        buf->omx_buf->nFilledLen);
+    gst_buffer_unmap (hdrs, &map);
+    self->headers = g_list_append (self->headers, gst_buffer_ref (hdrs));
+    frame->output_buffer = hdrs;
+    flow_ret =
+        gst_video_encoder_finish_subframe (GST_VIDEO_ENCODER (self), frame);
+    gst_video_codec_frame_unref (frame);
+
+    return flow_ret;
+  } else if (self->headers) {
+    gst_video_encoder_set_headers (GST_VIDEO_ENCODER (self), self->headers);
+    self->headers = NULL;
+  }
+
+  return
+      GST_OMX_VIDEO_ENC_CLASS
+      (gst_omx_h265_enc_parent_class)->handle_output_frame (enc, port, buf,
+      frame);
 }

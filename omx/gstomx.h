@@ -118,6 +118,11 @@ G_BEGIN_DECLS
 } G_STMT_END
 #endif
 
+/* If set on an element property means "use the OMX default value".
+ * If set on a default_* variable means that the default values hasn't been
+ * retrieved from OMX yet. */
+#define GST_OMX_PROP_OMX_DEFAULT G_MAXUINT32
+
 /* OMX_StateInvalid does not exist in 1.2.0 spec. The initial state is now
  * StateLoaded. Problem is that gst-omx still needs an initial state different
  * than StateLoaded. Otherwise gst_omx_component_set_state(StateLoaded) will
@@ -195,6 +200,13 @@ G_BEGIN_DECLS
  */
 #define GST_OMX_HACK_PASS_COLOR_FORMAT_TO_DECODER        G_GUINT64_CONSTANT (0x0000000000001000)
 
+/* If set, automatically update nBufferCountActual to nBufferCountMin before
+ * allocating buffers. This can be used on OMX implementation decreasing
+ * nBufferCountMin depending of the format and so can reduce the number
+ * of allocated buffers.
+ */
+#define GST_OMX_HACK_ENSURE_BUFFER_COUNT_ACTUAL          G_GUINT64_CONSTANT (0x0000000000002000)
+
 typedef struct _GstOMXCore GstOMXCore;
 typedef struct _GstOMXPort GstOMXPort;
 typedef enum _GstOMXPortDirection GstOMXPortDirection;
@@ -213,7 +225,9 @@ typedef enum {
   /* The port is EOS */
   GST_OMX_ACQUIRE_BUFFER_EOS,
   /* A fatal error happened */
-  GST_OMX_ACQUIRE_BUFFER_ERROR
+  GST_OMX_ACQUIRE_BUFFER_ERROR,
+  /* No buffer is currently available (used when calling gst_omx_port_acquire_buffer() in not waiting mode) */
+  GST_OMX_ACQUIRE_BUFFER_NO_AVAILABLE,
 } GstOMXAcquireBufferReturn;
 
 struct _GstOMXCore {
@@ -256,6 +270,11 @@ typedef enum {
   GST_OMX_BUFFER_ALLOCATION_USE_BUFFER,
   GST_OMX_BUFFER_ALLOCATION_USE_BUFFER_DYNAMIC, /* Only supported by OMX 1.2.0 */
 } GstOMXBufferAllocation;
+
+typedef enum {
+  GST_OMX_WAIT,
+  GST_OMX_DONT_WAIT,
+} GstOMXWait;
 
 struct _GstOMXMessage {
   GstOMXMessageType type;
@@ -305,6 +324,7 @@ struct _GstOMXPort {
   gboolean disabled_pending; /* was done until it took effect */
   gboolean eos; /* TRUE after a buffer with EOS flag was received */
   GstOMXBufferAllocation allocation;
+  gboolean using_pool; /* TRUE if the buffers of this port are managed by a pool */
 
   /* Increased whenever the settings of these port change.
    * If settings_cookie != configured_settings_cookie
@@ -315,6 +335,8 @@ struct _GstOMXPort {
 };
 
 struct _GstOMXComponent {
+  GstMiniObject mini_object;
+
   GstObject *parent;
 
   gchar *name; /* for debugging mostly */
@@ -399,9 +421,11 @@ guint64           gst_omx_parse_hacks (gchar ** hacks);
 GstOMXCore *      gst_omx_core_acquire (const gchar * filename);
 void              gst_omx_core_release (GstOMXCore * core);
 
+GType             gst_omx_component_get_type (void);
 
 GstOMXComponent * gst_omx_component_new (GstObject * parent, const gchar *core_name, const gchar *component_name, const gchar * component_role, guint64 hacks);
-void              gst_omx_component_free (GstOMXComponent * comp);
+GstOMXComponent * gst_omx_component_ref   (GstOMXComponent * comp);
+void              gst_omx_component_unref (GstOMXComponent * comp);
 
 OMX_ERRORTYPE     gst_omx_component_set_state (GstOMXComponent * comp, OMX_STATETYPE state);
 OMX_STATETYPE     gst_omx_component_get_state (GstOMXComponent * comp, GstClockTime timeout);
@@ -425,7 +449,7 @@ OMX_ERRORTYPE     gst_omx_close_tunnel (GstOMXPort * port1, GstOMXPort * port2);
 OMX_ERRORTYPE     gst_omx_port_get_port_definition (GstOMXPort * port, OMX_PARAM_PORTDEFINITIONTYPE * port_def);
 OMX_ERRORTYPE     gst_omx_port_update_port_definition (GstOMXPort *port, OMX_PARAM_PORTDEFINITIONTYPE *port_definition);
 
-GstOMXAcquireBufferReturn gst_omx_port_acquire_buffer (GstOMXPort *port, GstOMXBuffer **buf);
+GstOMXAcquireBufferReturn gst_omx_port_acquire_buffer (GstOMXPort *port, GstOMXBuffer **buf, GstOMXWait wait);
 OMX_ERRORTYPE     gst_omx_port_release_buffer (GstOMXPort *port, GstOMXBuffer *buf);
 
 OMX_ERRORTYPE     gst_omx_port_set_flushing (GstOMXPort *port, GstClockTime timeout, gboolean flush);
@@ -437,12 +461,19 @@ OMX_ERRORTYPE     gst_omx_port_use_eglimages (GstOMXPort *port, const GList *ima
 OMX_ERRORTYPE     gst_omx_port_deallocate_buffers (GstOMXPort *port);
 OMX_ERRORTYPE     gst_omx_port_populate (GstOMXPort *port);
 OMX_ERRORTYPE     gst_omx_port_wait_buffers_released (GstOMXPort * port, GstClockTime timeout);
+void              gst_omx_port_requeue_buffer (GstOMXPort * port, GstOMXBuffer * buf);
 
 OMX_ERRORTYPE     gst_omx_port_mark_reconfigured (GstOMXPort * port);
 
 OMX_ERRORTYPE     gst_omx_port_set_enabled (GstOMXPort * port, gboolean enabled);
 OMX_ERRORTYPE     gst_omx_port_wait_enabled (GstOMXPort * port, GstClockTime timeout);
 gboolean          gst_omx_port_is_enabled (GstOMXPort * port);
+gboolean          gst_omx_port_ensure_buffer_count_actual (GstOMXPort * port, guint extra);
+gboolean          gst_omx_port_update_buffer_count_actual (GstOMXPort * port, guint nb);
+
+gboolean          gst_omx_port_set_dmabuf (GstOMXPort * port, gboolean dmabuf);
+gboolean          gst_omx_port_set_subframe (GstOMXPort * port, gboolean enabled);
+gboolean          gst_omx_port_get_subframe (GstOMXPort * port);
 
 /* OMX 1.2.0 dynamic allocation mode */
 gboolean          gst_omx_is_dynamic_allocation_supported (void);

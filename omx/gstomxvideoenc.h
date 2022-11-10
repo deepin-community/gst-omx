@@ -67,7 +67,7 @@ struct _GstOMXVideoEnc
   GMutex drain_lock;
   GCond drain_cond;
   /* TRUE if EOS buffers shouldn't be forwarded */
-  gboolean draining;
+  gboolean draining; /* protected by drain_lock */
 
   /* properties */
   guint32 control_rate;
@@ -92,13 +92,23 @@ struct _GstOMXVideoEnc
   guint32 slice_size;
   gboolean dependent_slice;
   gint default_roi_quality;
+  gboolean long_term_ref;
+  guint32 long_term_freq;
+  guint32 look_ahead;
 #endif
+
+  guint32 default_target_bitrate;
 
   GstFlowReturn downstream_flow_ret;
 
   GstOMXBufferAllocation input_allocation;
   /* TRUE if encoder is passing dmabuf's fd directly to the OMX component */
   gboolean input_dmabuf;
+  /* Number of buffers requested downstream */
+  guint nb_downstream_buffers;
+
+  /* TRUE if input buffers are from the pool we proposed to upstream */
+  gboolean in_pool_used;
 
 #ifdef USE_OMX_TARGET_ZYNQ_USCALE_PLUS
   GEnumClass *alg_roi_quality_enum_class;

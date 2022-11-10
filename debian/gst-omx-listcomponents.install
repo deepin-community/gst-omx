@@ -1,1 +1,2 @@
-tools/gst-omx-listcomponents usr/bin
+#!/usr/bin/dh-exec
+obj-${DEB_HOST_GNU_TYPE}/tools/listcomponents => usr/bin/gst-omx-listcomponents

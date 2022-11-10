@@ -74,7 +74,7 @@ struct _GstOMXVideoDec
   GMutex drain_lock;
   GCond drain_cond;
   /* TRUE if EOS buffers shouldn't be forwarded */
-  gboolean draining;
+  gboolean draining; /* protected by drain_lock */
 
   GstFlowReturn downstream_flow_ret;
   /* Initially FALSE. Switched to TRUE when all requirements
@@ -110,7 +110,6 @@ struct _GstOMXVideoDecClass
 
   gboolean (*is_format_change) (GstOMXVideoDec * self, GstOMXPort * port, GstVideoCodecState * state);
   gboolean (*set_format)       (GstOMXVideoDec * self, GstOMXPort * port, GstVideoCodecState * state);
-  GstFlowReturn (*prepare_frame)   (GstOMXVideoDec * self, GstVideoCodecFrame *frame);
 };
 
 GType gst_omx_video_dec_get_type (void);
